@@ -75,6 +75,44 @@ bot = Bot(token=TOKEN)
 
 headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.302 Safari/537.36'}
 
+def calculate_atr(response, period=14):
+    # 1. 응답 데이터에서 실제 캔들 리스트만 추출
+    if isinstance(response, dict) and 'data' in response:
+        candle_list = response['data']
+    else:
+        candle_list = response
+
+    # 2. 데이터 개수 확인
+    if not candle_list or len(candle_list) <= period:
+        print(f"데이터 부족: 현재 {len(candle_list) if candle_list else 0}개")
+        return None
+
+    # 3. 비트겟 데이터 정렬 확인 (타임스탬프 기준 과거->현재 순으로 정렬)
+    # 비트겟 V2는 보통 최신 데이터가 [0]번에 옵니다. 계산을 위해 뒤집어줍니다.
+    if float(candle_list[0][0]) > float(candle_list[-1][0]):
+        candle_list = candle_list[::-1]
+
+    # 4. TR(True Range) 계산
+    tr_list = []
+    for i in range(1, len(candle_list)):
+        high = float(candle_list[i][2])
+        low = float(candle_list[i][3])
+        prev_close = float(candle_list[i-1][4])
+        
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close)
+        )
+        tr_list.append(tr)
+
+    # 5. ATR 계산 (Wilder's Smoothing)
+    atr = sum(tr_list[:period]) / period
+    for i in range(period, len(tr_list)):
+        atr = (atr * (period - 1) + tr_list[i]) / period
+        
+    return atr
+
 def tg_send(text):
     try:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -318,7 +356,15 @@ if __name__ == "__main__":
     main_api_key, main_secret_key, main_passphrase = get_exchange_credentials('Main')
     walletApi = wallet.WalletApi(main_api_key, main_secret_key, main_passphrase, use_server_time=False, first=False)
 
+    # 1. 데이터 가져오기 (충분한 데이터 확보를 위해 limit을 100 이상 권장)
+    raw_data = marketApi.get_perp_candles("BTCUSDT", "1H", limit=100)
+
+    # 2. ATR 계산
+    print(raw_data)
+    current_atr = calculate_atr(raw_data, period=14)
+
     while True:
+        print(f"현재 BTCUSDT 1시간봉 ATR: {current_atr}")
         close_price = float(marketApi.ticker(symbol,'USDT-FUTURES')['data'][0]['lastPr'])
         chgUtc = float(marketApi.ticker(symbol,'USDT-FUTURES')['data'][0]['changeUtc24h'])*100
         chgUtcWoAbs = chgUtc
