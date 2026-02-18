@@ -113,6 +113,20 @@ def calculate_atr(response, period=14):
         
     return atr
 
+def trend_strength(df, atr, span=50):
+    close = df.iloc[:, 4].astype(float)
+
+    if len(close) < span + 1:
+        return 0.0   # 데이터 부족 → 추세 없음
+
+    ema = close.ewm(span=span).mean()
+
+    slope = ema.iloc[-1] - ema.iloc[-span]
+    normalized_slope = slope / atr if atr > 0 else 0
+
+    strength = np.tanh(abs(normalized_slope) * 3)
+    return strength
+
 def tg_send(text):
     try:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -356,15 +370,24 @@ if __name__ == "__main__":
     main_api_key, main_secret_key, main_passphrase = get_exchange_credentials('Main')
     walletApi = wallet.WalletApi(main_api_key, main_secret_key, main_passphrase, use_server_time=False, first=False)
 
-    # 1. 데이터 가져오기 (충분한 데이터 확보를 위해 limit을 100 이상 권장)
-    raw_data = marketApi.get_perp_candles("BTCUSDT", "1H", limit=100)
-
-    # 2. ATR 계산
-    print(raw_data)
-    current_atr = calculate_atr(raw_data, period=14)
+    cols = [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "quote_volume"
+    ]
 
     while True:
+        # 1. 데이터 가져오기 (충분한 데이터 확보를 위해 limit을 100 이상 권장)
+        raw_data = marketApi.get_perp_candles("BTCUSDT", "1H", limit=100)
+        current_atr = calculate_atr(raw_data, period=14)
+        df = pd.DataFrame(raw_data, columns=cols)
+        trend = trend_strength(df, current_atr, span=50)
         print(f"현재 BTCUSDT 1시간봉 ATR: {current_atr}")
+        print("Trend Strength:", trend)
         close_price = float(marketApi.ticker(symbol,'USDT-FUTURES')['data'][0]['lastPr'])
         chgUtc = float(marketApi.ticker(symbol,'USDT-FUTURES')['data'][0]['changeUtc24h'])*100
         chgUtcWoAbs = chgUtc
