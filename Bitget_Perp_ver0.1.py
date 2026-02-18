@@ -113,7 +113,7 @@ def read_json(filename):
 
 def get_pos_index(live24, symbol, position_side):
     for i in range(len(live24['data'])):
-        print("get_pos_index>>i:{}/symbol:{}/holdSide:{}".format(i, live24['data'][i]['symbol'], live24['data'][i]['holdSide']))
+        #print("get_pos_index>>i:{}/symbol:{}/holdSide:{}".format(i, live24['data'][i]['symbol'], live24['data'][i]['holdSide']))
         if live24['data'][i]['symbol'] == symbol and live24['data'][i]['holdSide'] == position_side:
             return i
     # Raise an exception if no matching index is found
@@ -351,16 +351,22 @@ if __name__ == "__main__":
         short_take_profit = live24data['short_take_profit'] #0.999 #live24data['short_take_profit']
         try:
             idx = get_pos_index(position,coin,position_side)
+            if position_side == 'short':
+                myutil2.live24flag('short_position_running',filename2,True)
+            elif position_side == 'long':
+                myutil2.live24flag('long_positon_running',filename2,True)
         except:
             print("Positon not found/Ready To entry State")
             # 모두 포지션 재개 조건 충족시 가장 작은 사이즈로 진입
             if position_side == 'short':
+                myutil2.live24flag('short_position_running',filename2,False)
                 if long_profit > entry_percent:
                     orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_profit_line,1), timeInForceValue='normal')
                     message="[{}]1st Market Short Entry".format(account)
                     tg_send(message)
                     time.sleep(30)
             elif position_side == 'long':
+                myutil2.live24flag('long_position_running',filename2,False)
                 if short_profit > entry_percent:
                     orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='buy', tradeSide='open', marginMode='isolated', productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*long_profit_line,1), timeInForceValue='normal')
                     message="[{}]1st Market Long Entry".format(account)
@@ -467,10 +473,11 @@ if __name__ == "__main__":
                 else:
                     pass
 
-
+                if live24data['long_position_running']:
+                    print("long_profit:{} > entry_percent:{}".format(long_profit, entry_percent))
                 print("highest_short_price*(1+{}:{}):{}<close_price:{}".format(live24data['short_gap_rate'],1+live24data['short_gap_rate'],live24data['highest_short_price']*(1+live24data['short_gap_rate']),close_price))
                 if float(live24data['highest_short_price'])*(1+live24data['short_gap_rate'])<close_price:
-                    if long_profit > entry_percent:
+                    if live24data['long_position_running'] and long_profit > entry_percent:
                         try:
                             orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_take_profit,1), timeInForceValue='normal')
                             time.sleep(5)
@@ -506,9 +513,11 @@ if __name__ == "__main__":
                     pass
            
                 print("lowest_long_price*(1-{}:{}):{}>close_price:{}".format(live24data['long_gap_rate'],1-live24data['long_gap_rate'],live24data['lowest_long_price']*(1-live24data['long_gap_rate']),close_price))
+                if live24data['short_position_running']:
+                    print("short_profit:{} > entry_percent:{}".format(short_profit, entry_percent))
                 if float(live24data['lowest_long_price'])*(1-live24data['long_gap_rate'])>close_price:
                     if free > 1:
-                        if short_profit > entry_percent:
+                        if live24data['short_position_running'] and short_profit > entry_percent:
                             try:
                                 orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='buy', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), timeInForceValue='normal',presetStopSurplusPrice=round(close_price*long_take_profit,1))
                                 time.sleep(5)
