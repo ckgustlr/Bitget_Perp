@@ -3,7 +3,7 @@ from pickle import TRUE
 import subprocess
 import time
 import datetime
-from datetime import datetime, timezone, timedelta 
+#from datetime import datetime, timezone, timedelta 
 import requests
 import json
 import ccxt
@@ -75,57 +75,6 @@ bot = Bot(token=TOKEN)
 
 headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.302 Safari/537.36'}
 
-def calculate_atr(response, period=14):
-    # 1. 응답 데이터에서 실제 캔들 리스트만 추출
-    if isinstance(response, dict) and 'data' in response:
-        candle_list = response['data']
-    else:
-        candle_list = response
-
-    # 2. 데이터 개수 확인
-    if not candle_list or len(candle_list) <= period:
-        print(f"데이터 부족: 현재 {len(candle_list) if candle_list else 0}개")
-        return None
-
-    # 3. 비트겟 데이터 정렬 확인 (타임스탬프 기준 과거->현재 순으로 정렬)
-    # 비트겟 V2는 보통 최신 데이터가 [0]번에 옵니다. 계산을 위해 뒤집어줍니다.
-    if float(candle_list[0][0]) > float(candle_list[-1][0]):
-        candle_list = candle_list[::-1]
-
-    # 4. TR(True Range) 계산
-    tr_list = []
-    for i in range(1, len(candle_list)):
-        high = float(candle_list[i][2])
-        low = float(candle_list[i][3])
-        prev_close = float(candle_list[i-1][4])
-        
-        tr = max(
-            high - low,
-            abs(high - prev_close),
-            abs(low - prev_close)
-        )
-        tr_list.append(tr)
-
-    # 5. ATR 계산 (Wilder's Smoothing)
-    atr = sum(tr_list[:period]) / period
-    for i in range(period, len(tr_list)):
-        atr = (atr * (period - 1) + tr_list[i]) / period
-        
-    return atr
-
-def trend_strength(df, atr, span=50):
-    close = df.iloc[:, 4].astype(float)
-
-    if len(close) < span + 1:
-        return 0.0   # 데이터 부족 → 추세 없음
-
-    ema = close.ewm(span=span).mean()
-
-    slope = ema.iloc[-1] - ema.iloc[-span]
-    normalized_slope = slope / atr if atr > 0 else 0
-
-    strength = np.tanh(abs(normalized_slope) * 3)
-    return strength
 
 def tg_send(text):
     try:
@@ -311,6 +260,152 @@ def is_even_hour():
     hour = datetime.now().hour
     return hour % 2 == 0
 
+def is_weekend_risk_zone(timestamp_ms):
+    dt = datetime.datetime.utcfromtimestamp(timestamp_ms / 1000)
+    weekday = dt.weekday()
+    hour = dt.hour
+
+    # 토요일 전체
+    if weekday == 5:
+        return True
+
+    # 일요일 + 저유동성 구간
+    if weekday == 6 and hour < 22:
+        return True
+
+    return False
+
+def resolve_market_state(asset, trend_strength, timestamp, is_macro_event=False):
+    if asset == "BTCUSDT":
+        return resolve_btc_state(trend_strength, timestamp, is_macro_event)
+    elif asset == "QQQUSDT":
+        return resolve_qqq_state(trend_strength, is_macro_event)
+    else:
+        return "normal"
+
+def resolve_btc_state(trend_strength, timestamp, is_macro_event):
+    if is_macro_event:
+        return "post_event"
+
+    if trend_strength > 0.6:
+        return "trend_up"
+
+    if is_weekend_risk_zone(timestamp):
+        return "weekend_range"
+
+    return "weekday_swing"
+
+def resolve_qqq_state(trend_strength, is_macro_event):
+    if is_macro_event:
+        return "macro_event"
+
+    if trend_strength > 0.6:
+        return "trend"
+
+    return "normal"
+
+def trend_strength(df, atr, span=21):
+    """
+    추세 강도 = EMA 기울기 / ATR
+    """
+    if len(df) < span + 2 or atr == 0:
+        return 0.0
+
+    ema = df["close"].ewm(span=span, adjust=False).mean()
+
+    # 최근 기울기
+    slope = ema.iloc[-1] - ema.iloc[-2]
+
+    # ATR로 정규화
+    strength = slope / atr
+    return strength
+    
+def calculate_atr(df: pd.DataFrame, period: int = 14):
+    if df is None or len(df) <= period:
+        return None
+
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+
+    prev_close = close.shift(1)
+
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+
+    atr = tr.rolling(window=period).mean()
+
+    return atr.iloc[-1]
+
+def get_alpha(symbol, state):
+    #alpha_key = STATE_TO_ALPHA_KEY[symbol][state]
+    return ALPHA_TABLE[symbol][state]["alpha"]
+
+def gap_velocity(gap_hist, window=3):
+    """
+    gap_hist: list or deque of gap values (float)
+    window: 최근 몇 개 기준으로 속도 계산
+    """
+    if len(gap_hist) < window + 1:
+        return 0.0
+
+    diffs = [
+        gap_hist[i] - gap_hist[i - 1]
+        for i in range(-window + 1, 0)
+    ]
+    return sum(diffs) / len(diffs)
+
+def compute_T_control(
+    T_base,
+    gap_v,          # gap velocity (확장 속도)
+    hedge_pnl,      # 현재 hedge pnl (음수면 손실)
+    free_margin,
+    used_margin,
+    alpha,          # 현재 시장 변동성 기반 alpha
+    alpha_base,     # 기준 alpha
+    T_min,
+    T_max,
+    gap_scale=1.0
+):
+    """
+    T_control:
+    - 다음 진입까지 기다릴 봉 수
+    - 클수록 보수적, 작을수록 공격적
+    """
+
+    # 1️⃣ 마진 스트레스
+    if used_margin > 0:
+        margin_stress = 1.0 - (free_margin / (free_margin + used_margin))
+    else:
+        margin_stress = 0.0
+
+    # 2️⃣ 손실 스트레스 (손실일 때만 반영)
+    pnl_stress = max(0.0, -hedge_pnl)
+
+    # 3️⃣ 갭 확장 스트레스
+    gap_stress = abs(gap_v) * gap_scale
+
+    # 4️⃣ 시장 변동성 스트레스
+    vol_stress = max(0.0, alpha / alpha_base - 1.0)
+
+    # 5️⃣ 총 스트레스 (선형 합)
+    stress = (
+        0.4 * margin_stress +
+        0.3 * pnl_stress +
+        0.2 * gap_stress +
+        0.1 * vol_stress
+    )
+
+    # 6️⃣ T 조정
+    T = T_base * (1.0 + stress)
+
+    # 7️⃣ 하드 클램프
+    T = max(T_min, min(T, T_max))
+
+    return int(round(T))
 
 if __name__ == "__main__":
     cnt=0
@@ -334,21 +429,60 @@ if __name__ == "__main__":
     if coin == 'QQQUSDT':
         symbol = 'QQQUSDT'
         symbol2 = 'qqqusdt'
-        entry_percent = 0.5 # 최초 진입점 및, 이후 진입 기준점 
+        #entry_percent = 0.5 # 최초 진입점 및, 이후 진입 기준점 
         bet_sizex_div = 0.5 # 진입비율 계산용 계수 
         bet_size_base = 0.01 # 최소 진입 사이즈 
         gap_base_rate = 0.001 # 갭 계산용 계수
         gap_expend_rate = 0.0001 # 갭 확장 계산용 계수
+        T_PARAMS = dict( T_base=8, T_min=3, T_max=16, alpha_base=0.0025, # 0.2~0.3% 
+        gap_scale=1.5 )
 
 
     elif coin == 'BTCUSDT':
         symbol = 'BTCUSDT'
         symbol2 = 'btcusdt'
-        entry_percent = 0.5
+        #entry_percent = 0.5
         bet_sizex_div = 0.005
         bet_size_base = 0.0001
         gap_base_rate = 0.002
         gap_expend_rate = 0.0001
+        T_PARAMS = dict( T_base=6, T_min=2, T_max=12, alpha_base=0.008, # 0.5~1% 영역 
+        gap_scale=1.0 )
+
+    ALPHA_TABLE = {
+        "BTCUSDT": {
+            "trend_up": {
+                "alpha": 0.012,
+                "desc": "강한 상승 추세"
+            },
+            "weekday_swing": {
+                "alpha": 0.008,
+                "desc": "평일 스윙"
+            },
+            "weekend_range": {
+                "alpha": 0.004,
+                "desc": "주말 횡보"
+            },
+            "post_event": {
+                "alpha": 0.015,
+                "desc": "이벤트 직후"
+            }
+        },
+    "QQQUSDT": {
+            "macro_event": {
+                "alpha": 0.010,   # 1.0% — 이벤트 직후, 변동성 폭주 구간
+                "desc": "매크로 이벤트 직후"
+            },
+            "trend": {
+                "alpha": 0.006,   # 0.6% — 명확한 추세, 눌림/확장 대응
+                "desc": "추세 구간"
+            },
+            "normal": {
+                "alpha": 0.003,   # 0.3% — 평시 레인지
+                "desc": "일반 구간"
+            }
+        }
+    }
 
     filename2  = coin+'_'+account+'.json'
     filename  = account+'.json'
@@ -381,14 +515,83 @@ if __name__ == "__main__":
     ]
 
     while True:
+        close_price = float(marketApi.ticker(symbol,'USDT-FUTURES')['data'][0]['lastPr'])
         # 1. 데이터 가져오기 (충분한 데이터 확보를 위해 limit을 100 이상 권장)
         raw_data = marketApi.get_perp_candles("BTCUSDT", "1H", limit=100)
-        current_atr = calculate_atr(raw_data, period=14)
-        df = pd.DataFrame(raw_data, columns=cols)
-        trend = trend_strength(df, current_atr, span=50)
-        print(f"현재 BTCUSDT 1시간봉 ATR: {current_atr}")
-        print("Trend Strength:", trend)
-        close_price = float(marketApi.ticker(symbol,'USDT-FUTURES')['data'][0]['lastPr'])
+        data =raw_data['data']
+        cols = [
+            "open_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "quote_volume"
+        ]
+        df = pd.DataFrame(data, columns=cols)
+        current_atr = calculate_atr(df, period=14)
+
+        for c in ["open", "high", "low", "close", "volume", "quote_volume"]:
+            df[c] = df[c].astype(float)
+
+        df["open_time"] = df["open_time"].astype("int64")
+        T_market = trend_strength(df, current_atr, span=21)
+        close_price = df["close"].iloc[-1]
+        print(f"현재 1시간봉 ATR/close_price: {current_atr/close_price}") 
+        print("T_market Trend Strength:", T_market) 
+
+        hedge_pnl = 0.2 
+        free_margin = 500
+        used_margin = 1500
+
+        alpha = current_atr/close_price
+        
+        gap_hist = [0.012, 0.014] # 예시
+        
+        gap_v = gap_velocity(gap_hist)
+
+        #print( 'T_base:', T_PARAMS['T_base'], type(T_PARAMS['T_base']), 'gap_v:', gap_v, type(gap_v), 'hedge_pnl:', hedge_pnl, type(hedge_pnl), 'free_margin:', free_margin, type(free_margin), 'used_margin:', used_margin, type(used_margin), 'alpha:', alpha, type(alpha), 'alpha_base:', T_PARAMS['alpha_base'], type(T_PARAMS['alpha_base']), 'T_min:', T_PARAMS['T_min'], type(T_PARAMS['T_min']), 'T_max:', T_PARAMS['T_max'], type(T_PARAMS['T_max']), 'gap_scale:', T_PARAMS['gap_scale'], type(T_PARAMS['gap_scale']) )
+        T_control = compute_T_control( T_PARAMS['T_base'], gap_v, hedge_pnl, free_margin, used_margin, alpha, T_PARAMS['alpha_base'], T_PARAMS['T_min'], T_PARAMS['T_max'], T_PARAMS['gap_scale'] )
+        print("T_control (bars):", T_control)
+
+        # --------------------------------------------------
+        # t_market / t_control concept (future use)
+        #
+        # t_market  : estimated market speed (ATR, gap_velocity, trend)
+        # t_control : system reaction speed (risk tolerance, phase control)
+        #
+        # Idea:
+        # - Use (t_market / t_control) to adjust gap size
+        # - Use (t_control / t_market) to adjust entry timing
+        #
+        # Purpose:
+        # - Prevent overreaction in fast markets
+        # - Slow down entries under stress
+        # - Keep avg reference intact while improving resilience
+        #
+        # Not activated yet (phase1 uses fixed gap logic)
+        # --------------------------------------------------
+
+        # Gap control logic:
+        # - Start with conservative base gap (0.2%)
+        # - Expand gap gradually per entry until market-allowed cap (~0.38%)
+        # - After cap is reached, gap is frozen
+        # - Further risk control must shift from gap -> size differential (stress list)
+
+
+        state = resolve_market_state(
+            asset=symbol,
+            trend_strength=T_market,
+            timestamp=time.time(),
+            is_macro_event=False
+        )
+
+        alpha_scale = get_alpha(symbol, state)
+        alpha = (current_atr / close_price) * alpha_scale
+
+        print(f"Market State: {state}, Alpha Scale: {alpha_scale}, Adjusted Alpha*100: {alpha*100}%")
+        print(f"Gap (price): {close_price * alpha}")
+
         chgUtc = float(marketApi.ticker(symbol,'USDT-FUTURES')['data'][0]['changeUtc24h'])*100
         chgUtcWoAbs = chgUtc
         balances = accountApi.account(coin,'USDT-FUTURES', marginCoin=marginC)
@@ -429,14 +632,14 @@ if __name__ == "__main__":
             # 모두 포지션 재개 조건 충족시 가장 작은 사이즈로 진입
             if position_side == 'short':
                 myutil2.live24flag('short_position_running',filename2,False)
-                if long_profit > entry_percent:
+                if long_profit > alpha*100:
                     orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_profit_line,1), timeInForceValue='normal')
                     message="[{}]1st Market Short Entry".format(account)
                     tg_send(message)
                     time.sleep(30)
             elif position_side == 'long':
                 myutil2.live24flag('long_position_running',filename2,False)
-                if short_profit > entry_percent:
+                if short_profit > alpha*100:
                     orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='buy', tradeSide='open', marginMode='isolated', productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*long_profit_line,1), timeInForceValue='normal')
                     message="[{}]1st Market Long Entry".format(account)
                     tg_send(message)
@@ -533,7 +736,7 @@ if __name__ == "__main__":
                             sell_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'sell' and entry['symbol'] == symbol]
                             sorted_sell_orders = sorted(sell_orders, key=lambda x: float(x['triggerPrice']),reverse=True)[0]
                             trg_price = round(close_price*0.9998,1) # 2025-08-31
-                            result = planApi.modify_tpsl_plan_v2(symbol=symbol2, marginCoin="USDT", productType="USDT-FUTURES", orderId=sorted_sell_orders['orderId'], triggerPrice=trg_price,executePrice=trg_price,size=sorted_sell_orders['size'])
+                            #result = planApi.modify_tpsl_plan_v2(symbol=symbol2, marginCoin="USDT", productType="USDT-FUTURES", orderId=sorted_sell_orders['orderId'], triggerPrice=trg_price,executePrice=trg_price,size=sorted_sell_orders['size'])
                             myutil2.live24flag('highest_short_price',filename2,trg_price)
                             message = "[{}][liquidationPrice*0.98:{}<close_price:{}][short:{}/free:{}USD/long:{}][{}][achievedProfits:{}>0]/lowest_triggerPrice:{}/avg_price:{} -> modifytpsl:{}/size:{}".format(account,liquidationPrice*0.98,close_price,live24data['short_absamount'],free,live24data['long_absamount'],position_side,achievedProfits,sorted_sell_orders['triggerPrice'],avg_price,trg_price,sorted_sell_orders['size'])
                             time.sleep(8)
@@ -543,10 +746,10 @@ if __name__ == "__main__":
                     pass
 
                 if live24data['long_position_running']:
-                    print("long_profit:{} > entry_percent:{}".format(long_profit, entry_percent))
+                    print("long_profit:{} > alpha*100:{}".format(long_profit, alpha*100))
                 print("highest_short_price*(1+{}:{}):{}<close_price:{}".format(live24data['short_gap_rate'],1+live24data['short_gap_rate'],live24data['highest_short_price']*(1+live24data['short_gap_rate']),close_price))
                 if float(live24data['highest_short_price'])*(1+live24data['short_gap_rate'])<close_price:
-                    if live24data['long_position_running'] and long_profit > entry_percent:
+                    if live24data['long_position_running'] and long_profit > alpha*100:
                         try:
                             orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_take_profit,1), timeInForceValue='normal')
                             time.sleep(5)
@@ -571,10 +774,10 @@ if __name__ == "__main__":
                             sell_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'buy' and entry['symbol'] == symbol]
                             sorted_sell_orders = sorted(sell_orders, key=lambda x: float(x['triggerPrice']),reverse=False)[0]
                             trg_price = round(close_price*1.0002,1) #2025-08-31
-                            result = planApi.modify_tpsl_plan_v2(symbol="qqqusdt", marginCoin="USDT", productType="USDT-FUTURES", orderId=sorted_sell_orders['orderId'], triggerPrice=trg_price,executePrice=trg_price,size=sorted_sell_orders['size'])
+                            #result = planApi.modify_tpsl_plan_v2(symbol="qqqusdt", marginCoin="USDT", productType="USDT-FUTURES", orderId=sorted_sell_orders['orderId'], triggerPrice=trg_price,executePrice=trg_price,size=sorted_sell_orders['size'])
                             myutil2.live24flag('lowest_long_price',filename2,trg_price)
-                            message = "[freeless][{}][liquidationPrice*1.1:{}>close_price:{}][short:{}/free:{}USD/long:{}][{}][achievedProfits:{}>0]/lowest_triggerPrice:{}/avg_price:{} -> modifytpsl:{}/size:{}".format(account,liquidationPrice*1.1,close_price,live24data['short_absamount'],free,live24data['long_absamount'],position_side,achievedProfits,sorted_sell_orders['triggerPrice'],avg_price,trg_price,sorted_sell_orders['size'])
-                            tg_send(message)
+#                            message = "[freeless][{}][liquidationPrice*1.1:{}>close_price:{}][short:{}/free:{}USD/long:{}][{}][achievedProfits:{}>0]/lowest_triggerPrice:{}/avg_price:{} -> modifytpsl:{}/size:{}".format(account,liquidationPrice*1.1,close_price,live24data['short_absamount'],free,live24data['long_absamount'],position_side,achievedProfits,sorted_sell_orders['triggerPrice'],avg_price,trg_price,sorted_sell_orders['size'])
+                            #tg_send(message)
                             time.sleep(8)
                         except:
                             pass
@@ -583,10 +786,10 @@ if __name__ == "__main__":
            
                 print("lowest_long_price*(1-{}:{}):{}>close_price:{}".format(live24data['long_gap_rate'],1-live24data['long_gap_rate'],live24data['lowest_long_price']*(1-live24data['long_gap_rate']),close_price))
                 if live24data['short_position_running']:
-                    print("short_profit:{} > entry_percent:{}".format(short_profit, entry_percent))
+                    print("short_profit:{} > alpha*100:{}".format(short_profit, alpha*100))
                 if float(live24data['lowest_long_price'])*(1-live24data['long_gap_rate'])>close_price:
                     if free > 1:
-                        if live24data['short_position_running'] and short_profit > entry_percent:
+                        if live24data['short_position_running'] and short_profit > alpha*100:
                             try:
                                 orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='buy', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), timeInForceValue='normal',presetStopSurplusPrice=round(close_price*long_take_profit,1))
                                 time.sleep(5)
@@ -602,16 +805,20 @@ if __name__ == "__main__":
             print("count:{}".format(cnt))
             time.sleep(10)
 
-            if cnt%60 ==0:
+            if cnt%6 ==0:
                 print("long_avg_price:{}-short_avg_price:{}={}/{}%".format(live24data['long_avg_price'],live24data['short_avg_price'],avg_gap,gap_percent))
                 print("iquidationPrice:{}".format(liquidationPrice))
+                gap_dynamic_cap = T_market / T_control
+
                 if position_side == 'short':
-                    gap_rate = gap_base_rate
                     short_take_profit0= 1-profit_base_rate
                     myutil2.live24flag('short_take_profit',filename2,short_take_profit0)
+                    gap_effective = min(
+                    gap_base_rate + gap_expend_rate*live24data['sell_orders_count'],
+                    gap_dynamic_cap
+                    )
                     gap_expend = gap_expend_rate*live24data['sell_orders_count']
-                    gap_rate = gap_rate+gap_expend
-                    myutil2.live24flag('short_gap_rate',filename2,gap_rate)
+                    myutil2.live24flag('short_gap_rate',filename2,gap_effective)
                     myutil2.live24flag('short_liquidationPrice',filename2,liquidationPrice)
                     myutil2.live24flag('short_absamount',filename2,absamount)
                     myutil2.live24flag('short_avg_price',filename2,avg_price)
@@ -625,14 +832,14 @@ if __name__ == "__main__":
                     myutil2.live24flag('highest_short_price',filename2,float(sorted_sell_orders['triggerPrice']))
                     if liquidationPrice*ShortSafeMargin>close_price:
                         short_exit()
-                elif position_side == 'long':
-                    gap_rate = gap_base_rate                        
+                elif position_side == 'long':                     
                     long_take_profit0= 1+profit_base_rate
                     myutil2.live24flag('long_take_profit',filename2,long_take_profit0)
-                    gap_expend = gap_expend_rate*live24data['buy_orders_count']
-                    gap_rate = gap_rate+gap_expend
-                    print("long_gap_rate:{}".format(gap_rate))
-                    myutil2.live24flag('long_gap_rate',filename2,gap_rate)
+                    gap_effective = min(
+                    gap_base_rate + gap_expend_rate*live24data['buy_orders_count'],
+                    gap_dynamic_cap
+                    )
+                    myutil2.live24flag('long_gap_rate',filename2,gap_effective)
                     myutil2.live24flag('long_liquidationPrice',filename2,liquidationPrice)
                     myutil2.live24flag('long_absamount',filename2,absamount)
                     myutil2.live24flag('long_avg_price',filename2,avg_price)
