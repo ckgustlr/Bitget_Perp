@@ -424,7 +424,7 @@ if __name__ == "__main__":
     short_profit_line_adjust = 0.999 # 1% 넘었을때 close_price 기준으로 세팅갭 0.1%
     long_profit_line = 1.01 # 기타줄 초기 레벨
     long_profit_line_adjust = 1.011 # 1% 넘었을때 close_price 기준으로 세팅갭 0.1%
-    timeout = 9 # 9분마다 1% 기타줄 세팅
+
 
     if coin == 'QQQUSDT':
         symbol = 'QQQUSDT'
@@ -553,6 +553,8 @@ if __name__ == "__main__":
         #print( 'T_base:', T_PARAMS['T_base'], type(T_PARAMS['T_base']), 'gap_v:', gap_v, type(gap_v), 'hedge_pnl:', hedge_pnl, type(hedge_pnl), 'free_margin:', free_margin, type(free_margin), 'used_margin:', used_margin, type(used_margin), 'alpha:', alpha, type(alpha), 'alpha_base:', T_PARAMS['alpha_base'], type(T_PARAMS['alpha_base']), 'T_min:', T_PARAMS['T_min'], type(T_PARAMS['T_min']), 'T_max:', T_PARAMS['T_max'], type(T_PARAMS['T_max']), 'gap_scale:', T_PARAMS['gap_scale'], type(T_PARAMS['gap_scale']) )
         T_control = compute_T_control( T_PARAMS['T_base'], gap_v, hedge_pnl, free_margin, used_margin, alpha, T_PARAMS['alpha_base'], T_PARAMS['T_min'], T_PARAMS['T_max'], T_PARAMS['gap_scale'] )
         print("T_control (bars):", T_control)
+        base_time = 12
+        exit_interval = base_time * (T_control / abs(T_market))
 
         # --------------------------------------------------
         # t_market / t_control concept (future use)
@@ -615,7 +617,23 @@ if __name__ == "__main__":
             live24_backup=live24
         else:
             live24 = live24_backup
-        
+
+        if position_side == 'short':
+            current_scale_index = live24data['sell_orders_count']
+        elif position_side == 'long':
+            current_scale_index = live24data['buy_orders_count']
+        adjustment_count = current_scale_index + 1  # 1 ~ N
+
+        exit_interval = exit_interval / adjustment_count
+        MIN_EXIT_INTERVAL = 10  # bars or cycles
+        exit_interval = round(max(exit_interval, MIN_EXIT_INTERVAL))
+
+        # exit_interval_raw=1374
+        # adjustment_count=22
+        # exit_interval_final=53
+
+        print("exit_interval:", exit_interval)
+        timeout = exit_interval # 9분마다 1% 기타줄 세팅 무식해..ㅋ 
         position = positionApi.all_position(marginCoin='USDT', productType='USDT-FUTURES')
         short_profit = live24data['short_profit'] #1.001 #live24data['long_take_profit']
         long_profit = live24data['long_profit'] #0.999 #live24data['short_take_profit']
@@ -628,19 +646,22 @@ if __name__ == "__main__":
             elif position_side == 'long':
                 myutil2.live24flag('long_positon_running',filename2,True)
         except:
-            print("Positon not found/Ready To entry State")
             # 모두 포지션 재개 조건 충족시 가장 작은 사이즈로 진입
             if position_side == 'short':
+                print("short Positon not found/long_profit > alpha*100: {}/{}".format(long_profit, alpha*100))
                 myutil2.live24flag('short_position_running',filename2,False)
                 if long_profit > alpha*100:
                     orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_profit_line,1), timeInForceValue='normal')
+                    myutil2.live24flag('highest_short_price',filename2,float(close_price))
                     message="[{}]1st Market Short Entry".format(account)
                     tg_send(message)
                     time.sleep(30)
             elif position_side == 'long':
+                print("long Positon not found/short_profit > alpha*100: {}/{}".format(short_profit, alpha*100))
                 myutil2.live24flag('long_position_running',filename2,False)
                 if short_profit > alpha*100:
                     orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='buy', tradeSide='open', marginMode='isolated', productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*long_profit_line,1), timeInForceValue='normal')
+                    myutil2.live24flag('lowest_long_price',filename2,float(close_price))
                     message="[{}]1st Market Long Entry".format(account)
                     tg_send(message)
                     time.sleep(30)
@@ -747,15 +768,15 @@ if __name__ == "__main__":
 
                 if live24data['long_position_running']:
                     print("long_profit:{} > alpha*100:{}".format(long_profit, alpha*100))
-                print("highest_short_price*(1+{}:{}):{}<close_price:{}".format(live24data['short_gap_rate'],1+live24data['short_gap_rate'],live24data['highest_short_price']*(1+live24data['short_gap_rate']),close_price))
+                print("highest_short_price:{}*(1+{}:{}):{}<close_price:{}".format(live24data['highest_short_price'],live24data['short_gap_rate'],1+live24data['short_gap_rate'],live24data['highest_short_price']*(1+live24data['short_gap_rate']),close_price))
                 if float(live24data['highest_short_price'])*(1+live24data['short_gap_rate'])<close_price:
-                    if live24data['long_position_running'] and long_profit > alpha*100:
+                    if  live24data['long_position_running'] and long_profit > alpha*100: #long 포지션이 있고, long_profit이 alpha*100보다 클때만 진입, 롱포지션이 없으면 long_profit는 이전에 마지막 exit 시점의 상태라 왜곡된다 
                         try:
-                            orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_take_profit,1), timeInForceValue='normal')
+                            #orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_take_profit,1), timeInForceValue='normal')
                             time.sleep(5)
-                            result = planApi.current_plan_v2(planType="profit_loss", productType="USDT-FUTURES")
-                            sell_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'sell' and entry['symbol'] == symbol]
-                            sorted_sell_orders = sorted(sell_orders, key=lambda x: float(x['triggerPrice']),reverse=True)[0]
+                            # result = planApi.current_plan_v2(planType="profit_loss", productType="USDT-FUTURES")
+                            # sell_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'sell' and entry['symbol'] == symbol]
+                            # sorted_sell_orders = sorted(sell_orders, key=lambda x: float(x['triggerPrice']),reverse=True)[0]
                             print("short entry/triggerPrice:{}".format(sorted_sell_orders['triggerPrice']))
                             myutil2.live24flag('highest_short_price',filename2,float(close_price))
                             profit=exit_alarm_enable(avg_price,close_price,position_side)
@@ -774,7 +795,7 @@ if __name__ == "__main__":
                             sell_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'buy' and entry['symbol'] == symbol]
                             sorted_sell_orders = sorted(sell_orders, key=lambda x: float(x['triggerPrice']),reverse=False)[0]
                             trg_price = round(close_price*1.0002,1) #2025-08-31
-                            #result = planApi.modify_tpsl_plan_v2(symbol="qqqusdt", marginCoin="USDT", productType="USDT-FUTURES", orderId=sorted_sell_orders['orderId'], triggerPrice=trg_price,executePrice=trg_price,size=sorted_sell_orders['size'])
+                            #result = planApi.modify_tpsl_plan_v2(symbol=symbol2, marginCoin="USDT", productType="USDT-FUTURES", orderId=sorted_sell_orders['orderId'], triggerPrice=trg_price,executePrice=trg_price,size=sorted_sell_orders['size'])
                             myutil2.live24flag('lowest_long_price',filename2,trg_price)
 #                            message = "[freeless][{}][liquidationPrice*1.1:{}>close_price:{}][short:{}/free:{}USD/long:{}][{}][achievedProfits:{}>0]/lowest_triggerPrice:{}/avg_price:{} -> modifytpsl:{}/size:{}".format(account,liquidationPrice*1.1,close_price,live24data['short_absamount'],free,live24data['long_absamount'],position_side,achievedProfits,sorted_sell_orders['triggerPrice'],avg_price,trg_price,sorted_sell_orders['size'])
                             #tg_send(message)
@@ -784,18 +805,19 @@ if __name__ == "__main__":
                 else:
                     pass
            
-                print("lowest_long_price*(1-{}:{}):{}>close_price:{}".format(live24data['long_gap_rate'],1-live24data['long_gap_rate'],live24data['lowest_long_price']*(1-live24data['long_gap_rate']),close_price))
+                print("lowest_long_price:{}*(1-{}:{}):{}>close_price:{}".format(live24data['lowest_long_price'],live24data['long_gap_rate'],1-live24data['long_gap_rate'],live24data['lowest_long_price']*(1-live24data['long_gap_rate']),close_price))
                 if live24data['short_position_running']:
                     print("short_profit:{} > alpha*100:{}".format(short_profit, alpha*100))
                 if float(live24data['lowest_long_price'])*(1-live24data['long_gap_rate'])>close_price:
                     if free > 1:
-                        if live24data['short_position_running'] and short_profit > alpha*100:
+                        if live24data['short_position_running'] and short_profit > alpha*100: #short 포지션이 있고, short_profit이 alpha*100보다 클때만 진입, 숏포지션이 없으면 short_profit는 이전에 마지막 exit 시점의 상태라 왜곡된다
                             try:
                                 orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='buy', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), timeInForceValue='normal',presetStopSurplusPrice=round(close_price*long_take_profit,1))
                                 time.sleep(5)
-                                result = planApi.current_plan_v2(planType="profit_loss", productType="USDT-FUTURES")
-                                buy_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'buy' and entry['symbol'] == symbol]
-                                sorted_buy_orders = sorted(buy_orders, key=lambda x: float(x['triggerPrice']))[0]
+                                # result = planApi.current_plan_v2(planType="profit_loss", productType="USDT-FUTURES")
+                                # buy_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'buy' and entry['symbol'] == symbol]
+                                # sorted_buy_orders = sorted(buy_orders, key=lambda x: float(x['triggerPrice']))[0]
+                                # print("long entry/triggerPrice:{}".format(sorted_buy_orders['triggerPrice']))
                                 myutil2.live24flag('lowest_long_price',filename2,float(close_price))
                                 profit=exit_alarm_enable(avg_price,close_price,position_side)
                             except:
@@ -808,7 +830,7 @@ if __name__ == "__main__":
             if cnt%6 ==0:
                 print("long_avg_price:{}-short_avg_price:{}={}/{}%".format(live24data['long_avg_price'],live24data['short_avg_price'],avg_gap,gap_percent))
                 print("iquidationPrice:{}".format(liquidationPrice))
-                gap_dynamic_cap = T_market / T_control
+                gap_dynamic_cap = abs(T_market / T_control)
 
                 if position_side == 'short':
                     short_take_profit0= 1-profit_base_rate
@@ -826,10 +848,10 @@ if __name__ == "__main__":
                     result = planApi.current_plan_v2(planType="profit_loss", productType="USDT-FUTURES")
                     sell_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'sell' and entry['symbol'] == symbol]
                     myutil2.live24flag('sell_orders_count',filename2,len(sell_orders))
-                    sorted_sell_orders = sorted(sell_orders, key=lambda x: float(x['triggerPrice']))[0]
-                    myutil2.live24flag('lowest_short_price',filename2,float(sorted_sell_orders['triggerPrice']))
-                    sorted_sell_orders = sorted(sell_orders, key=lambda x: float(x['triggerPrice']),reverse=True)[0]
-                    myutil2.live24flag('highest_short_price',filename2,float(sorted_sell_orders['triggerPrice']))
+                    # sorted_sell_orders = sorted(sell_orders, key=lambda x: float(x['triggerPrice']))[0]
+                    # myutil2.live24flag('lowest_short_price',filename2,float(sorted_sell_orders['triggerPrice']))
+                    # sorted_sell_orders = sorted(sell_orders, key=lambda x: float(x['triggerPrice']),reverse=True)[0]
+                    # myutil2.live24flag('highest_short_price',filename2,float(sorted_sell_orders['triggerPrice']))
                     if liquidationPrice*ShortSafeMargin>close_price:
                         short_exit()
                 elif position_side == 'long':                     
@@ -847,10 +869,10 @@ if __name__ == "__main__":
                     result = planApi.current_plan_v2(planType="profit_loss", productType="USDT-FUTURES")
                     buy_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'buy' and entry['symbol'] == symbol]
                     myutil2.live24flag('buy_orders_count',filename2,len(buy_orders))
-                    sorted_buy_orders = sorted(buy_orders, key=lambda x: float(x['triggerPrice']),reverse=True)[0]
-                    myutil2.live24flag('highest_long_price',filename2,float(sorted_buy_orders['triggerPrice']))
-                    sorted_buy_orders = sorted(buy_orders, key=lambda x: float(x['triggerPrice']))[0]
-                    myutil2.live24flag('lowest_long_price',filename2,float(sorted_buy_orders['triggerPrice']))
+                    # sorted_buy_orders = sorted(buy_orders, key=lambda x: float(x['triggerPrice']),reverse=True)[0]
+                    # myutil2.live24flag('highest_long_price',filename2,float(sorted_buy_orders['triggerPrice']))
+                    # sorted_buy_orders = sorted(buy_orders, key=lambda x: float(x['triggerPrice']))[0]
+                    # myutil2.live24flag('lowest_long_price',filename2,float(sorted_buy_orders['triggerPrice']))
                     print(message)
                     if liquidationPrice*LongSafeMargin<close_price:
                         long_exit()
@@ -883,12 +905,9 @@ if __name__ == "__main__":
                     for i in range(len(sell_orders)):
                         sorted_sell_orders = sorted(sell_orders, key=lambda x: float(x['size']),reverse=False)[i]
                         sorted_price_sell_orders = sorted(sell_orders, key=lambda x: float(x['triggerPrice']),reverse=True)[i]
-                        if i == 0:
-                            trigger_price = sorted_sell_orders_last_price
-                        else:
-                            trigger_price = str(round(trigger_price0 - (sell_orders_unitgap*(i-1)),1))                               
+                        trigger_price = str(round(trigger_price0 - (sell_orders_unitgap*(i)),1))                               
                         print("[{}/{}][{}/{}][{}/{}]".format(i,sorted_sell_orders['size'],trigger_price,type(trigger_price).__name__,sorted_sell_orders['triggerPrice'],type(sorted_sell_orders['triggerPrice']).__name__))
-                        result = planApi.modify_tpsl_plan_v2(symbol="qqqusdt", marginCoin="USDT", productType="USDT-FUTURES", orderId=sorted_sell_orders['orderId'], triggerPrice=trigger_price,executePrice=trigger_price,size=sorted_sell_orders['size'])
+                        result = planApi.modify_tpsl_plan_v2(symbol=symbol2, marginCoin="USDT", productType="USDT-FUTURES", orderId=sorted_sell_orders['orderId'], triggerPrice=trigger_price,executePrice=trigger_price,size=sorted_sell_orders['size'])
                         time.sleep(1)
                     if pre_count != live24data['sell_orders_count']:
                         if profit > 0:
@@ -927,12 +946,9 @@ if __name__ == "__main__":
                     for i in range(len(buy_orders)):
                         sorted_buy_orders = sorted(buy_orders, key=lambda x: float(x['size']),reverse=False)[i]
                         sorted_price_buy_orders = sorted(buy_orders, key=lambda x: float(x['triggerPrice']),reverse=False)[i]
-                        if i ==0:
-                            trigger_price = sorted_buy_orders_last_price
-                        else:
-                            trigger_price = str(round(trigger_price0 + (buy_orders_unitgap*(i-1)),1))
+                        trigger_price = str(round(trigger_price0 + (buy_orders_unitgap*(i)),1))
                         print("[{}/{}][{}/{}][{}/{}]".format(i,sorted_buy_orders['size'],trigger_price,type(trigger_price).__name__,sorted_buy_orders['triggerPrice'],type(sorted_buy_orders['triggerPrice']).__name__))
-                        result = planApi.modify_tpsl_plan_v2(symbol="qqqusdt", marginCoin="USDT", productType="USDT-FUTURES", orderId=sorted_buy_orders['orderId'], triggerPrice=trigger_price,executePrice=trigger_price,size=sorted_buy_orders['size'])
+                        result = planApi.modify_tpsl_plan_v2(symbol=symbol2, marginCoin="USDT", productType="USDT-FUTURES", orderId=sorted_buy_orders['orderId'], triggerPrice=trigger_price,executePrice=trigger_price,size=sorted_buy_orders['size'])
                         time.sleep(1)
                     if profit > 0:
                         message = "[Long timeout:{}/count:{}][{}/{}]trigger_price:{}/gap:{}/last:{}]".format(timeout,i,live24data['long_absamount'],achievedProfits,round(trigger_price0,1),round(buy_orders_unitgap),round(sorted_buy_orders_last_price_1))
