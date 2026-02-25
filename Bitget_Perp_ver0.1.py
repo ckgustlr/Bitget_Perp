@@ -475,6 +475,122 @@ def cycle_entry_filter_hysteresis(
     else:
         raise ValueError("side must be 'long' or 'short'")
 
+def calc_APAE(
+    prev_avg_price: float,
+    curr_avg_price: float,
+    prev_price: float,
+    curr_price: float,
+    side: str,
+    eps: float = 1e-9
+) -> float:
+    """
+    APAE (Average Price Adjustment Efficiency) 계산
+
+    APAE = 평단이 유리하게 이동한 거리 / 가격이 이동한 전체 거리
+
+    :param prev_avg_price: 이전 평단
+    :param curr_avg_price: 현재 평단
+    :param prev_price: 이전 기준 가격 (예: 직전 캔들 close)
+    :param curr_price: 현재 가격
+    :param side: 'long' 또는 'short'
+    :param eps: 0 division 방지용
+    :return: APAE 값 (0 ~ 1 이상도 가능)
+    """
+
+    # 가격 이동 거리
+    price_move = abs(curr_price - prev_price)
+
+    if price_move < eps:
+        return 0.0
+
+    if side == 'long':
+        # 롱: 평단이 내려가면 유리
+        avg_move = prev_avg_price - curr_avg_price
+    elif side == 'short':
+        # 숏: 평단이 올라가면 유리
+        avg_move = curr_avg_price - prev_avg_price
+    else:
+        raise ValueError("side must be 'long' or 'short'")
+
+    # 불리한 방향 이동은 0 처리
+    avg_move = max(avg_move, 0.0)
+
+    apae = avg_move / price_move
+    return round(apae, 4)
+
+def can_rebuild_position(
+    side,
+    current_price,
+    average_price,
+    anchor_price,
+    initial_step,
+    increase_unit,
+    current_count,
+    trend_strength,
+    trend_eps
+):
+    """
+    부분청산 후 앵커 기준 재확장 가능 여부 판단
+    """
+
+    if anchor_price is None or current_count <= 0:
+        return False
+
+    # 다음 회차 기준 적정 레벨 계산
+    next_count = current_count + 1
+    entry_price = get_next_entry_level(
+        anchor_price,
+        side,
+        initial_step,
+        increase_unit,
+        next_count
+    )
+
+    # 1️⃣ 추세 필터
+    if side == "long" and trend_strength <= trend_eps:
+        return False
+    if side == "short" and trend_strength >= -trend_eps:
+        return False
+
+    # 2️⃣ 현재 수익 상태
+    if side == "long" and current_price <= average_price:
+        return False
+    if side == "short" and current_price >= average_price:
+        return False
+
+    # 3️⃣ 평단 갭 확장 여부
+    if side == "long":
+        expands_gap = entry_price < average_price
+    else:
+        expands_gap = entry_price > average_price
+
+    return expands_gap
+
+def get_next_entry_level(
+    base_price,
+    side,
+    ankor_step,
+    increase_unit,
+    count
+):
+    """
+    다음 회차 진입 가격 계산 (증분 방식)
+    """
+
+    if count <= 0:
+        return base_price
+
+    next_gap = ankor_step + (count - 1) * increase_unit
+
+    if side == "short":
+        result_price = base_price * (1 + next_gap)
+    elif side == "long":
+        result_price = base_price * (1 - next_gap)
+    else:
+        raise ValueError("side는 'short' 또는 'long'")
+
+    return round(result_price, 4)
+
 if __name__ == "__main__":
     cnt=0
     cntm=0
@@ -505,7 +621,6 @@ if __name__ == "__main__":
         gap_expend_rate = 0.0001 # 갭 확장 계산용 계수
         T_PARAMS = dict( T_base=8, T_min=3, T_max=16, alpha_base=0.0025, # 0.2~0.3% 
         gap_scale=1.5 )
-
 
     elif coin == 'BTCUSDT':
         symbol = 'BTCUSDT'
@@ -687,33 +802,6 @@ if __name__ == "__main__":
         else:
             live24 = live24_backup
 
-        short_profit = live24data['short_profit'] #1.001 #live24data['long_take_profit']
-        long_profit = live24data['long_profit'] #0.999 #live24data['short_take_profit']
-
-        if position_side == 'short':
-            current_scale_index = live24data['sell_orders_count']
-
-        elif position_side == 'long':
-            current_scale_index = live24data['buy_orders_count']
-
-        adjustment_count = current_scale_index + 1  # 1 ~ N
-
-        exit_interval = exit_interval / adjustment_count
-        MIN_EXIT_INTERVAL = 10  # bars or cycles
-        exit_interval = round(max(exit_interval, MIN_EXIT_INTERVAL))
-
-        # exit_interval_raw=1374
-        # adjustment_count=22
-        # exit_interval_final=53
-
-        exit_levels = calc_exit_levels(
-            price=price,
-            atr=atr,
-            remaining_count=current_scale_index
-        )
-
-        print(exit_levels)
-
         print("exit_interval:", exit_interval)
         timeout = exit_interval # 9분마다 1% 기타줄 세팅 무식해..ㅋ 
         position = positionApi.all_position(marginCoin='USDT', productType='USDT-FUTURES')
@@ -733,6 +821,7 @@ if __name__ == "__main__":
                 if long_profit > alpha*100 and T_market > 0.05: #can_enter_short and 0: #확실히 long 추세확인하고 진입 
                     orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_profit_line,1), timeInForceValue='normal')
                     myutil2.live24flag('highest_short_price',filename2,float(close_price))
+                    myutil2.live24flag('short_ankor_price',filename2,float(close_price))
                     message="[{}]1st Market Short Entry".format(account)
                     tg_send(message)
                     time.sleep(30)
@@ -742,6 +831,7 @@ if __name__ == "__main__":
                 if short_profit > alpha*100 and T_market < -0.05: #can_enter_long and 0: # 확실히 short 추세확인하고 진입
                     orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='buy', tradeSide='open', marginMode='isolated', productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*long_profit_line,1), timeInForceValue='normal')
                     myutil2.live24flag('lowest_long_price',filename2,float(close_price))
+                    myutil2.live24flag('long_ankor_price',filename2,float(close_price))
                     message="[{}]1st Market Long Entry".format(account)
                     tg_send(message)
                     time.sleep(30)
@@ -756,6 +846,46 @@ if __name__ == "__main__":
         #print(position)
         achievedProfits=round(float(position['achievedProfits']),1)
         avg_price = round(float(position['openPriceAvg']),3)
+
+        short_profit = live24data['short_profit'] #1.001 #live24data['long_take_profit']
+        long_profit = live24data['long_profit'] #0.999 #live24data['short_take_profit']
+
+        if position_side == 'short':
+            current_scale_index = live24data['sell_orders_count']
+            ankor_price= live24data['short_ankor_price']
+        elif position_side == 'long':
+            current_scale_index = live24data['buy_orders_count']
+            ankor_price = live24data['long_ankor_price']
+
+        if account == 'Sub10':
+            print("position_side: {}, close_price: {}, avg_price: {}, ankor_price: {}, gap_base_rate: {}, gap_expend_rate: {}, current_scale_index: {}, T_market: {}".format(position_side, close_price, avg_price, ankor_price, gap_base_rate, gap_expend_rate, current_scale_index, T_market))
+            reentry_filter = can_rebuild_position(position_side,close_price,avg_price,ankor_price,float(gap_base_rate),float(gap_expend_rate),current_scale_index,T_market,0.02)
+            entry_level = get_next_entry_level(avg_price,position_side,gap_base_rate,gap_expend_rate,current_scale_index + 1)
+            #entry_level = get_entry_level(avg_price, position_side, float(gap_base_rate), float(gap_expend_rate),current_scale_index+1)
+            if position_side == 'short':
+                print("Short Reentry Filter: {}, Short Entry Level: {}".format(reentry_filter, entry_level))
+            elif position_side == 'long':
+                print("Long Reentry Filter: {}, Long Entry Level: {}".format(reentry_filter, entry_level))
+        
+        adjustment_count = current_scale_index + 1  # 1 ~ N
+
+        exit_interval = exit_interval / adjustment_count
+        MIN_EXIT_INTERVAL = 10  # bars or cycles
+        exit_interval = round(max(exit_interval, MIN_EXIT_INTERVAL))
+
+        # exit_interval_raw=1374
+        # adjustment_count=22
+        # exit_interval_final=53
+
+        exit_levels = calc_exit_levels(
+            price=price,
+            atr=atr,
+            remaining_count=current_scale_index
+        )
+
+        print(exit_levels)
+
+
  #       print("close_price:{}/avg_price:{}".format(close_price,avg_price))
         absamount = float(position['available'])
 
@@ -838,7 +968,7 @@ if __name__ == "__main__":
                             sorted_sell_orders = sorted(sell_orders, key=lambda x: float(x['triggerPrice']),reverse=True)[0]
                             trg_price = round(close_price*0.9998,1) # 2025-08-31
                             #result = planApi.modify_tpsl_plan_v2(symbol=symbol2, marginCoin="USDT", productType="USDT-FUTURES", orderId=sorted_sell_orders['orderId'], triggerPrice=trg_price,executePrice=trg_price,size=sorted_sell_orders['size'])
-                            myutil2.live24flag('highest_short_price',filename2,trg_price)
+                            #myutil2.live24flag('highest_short_price',filename2,trg_price)
                             message = "[{}][liquidationPrice*0.98:{}<close_price:{}][short:{}/free:{}USD/long:{}][{}][achievedProfits:{}>0]/lowest_triggerPrice:{}/avg_price:{} -> modifytpsl:{}/size:{}".format(account,liquidationPrice*0.98,close_price,live24data['short_absamount'],free,live24data['long_absamount'],position_side,achievedProfits,sorted_sell_orders['triggerPrice'],avg_price,trg_price,sorted_sell_orders['size'])
                             time.sleep(8)
                         except:
@@ -849,12 +979,19 @@ if __name__ == "__main__":
                 if live24data['long_position_running']:
                     print("long_profit:{} > alpha*100:{}".format(long_profit, alpha*100))
                 print("highest_short_price:{}*(1+{}:{}):{}<close_price:{}".format(live24data['highest_short_price'],live24data['short_gap_rate'],1+live24data['short_gap_rate'],live24data['highest_short_price']*(1+live24data['short_gap_rate']),close_price))
-                if float(live24data['highest_short_price'])*(1+live24data['short_gap_rate'])<close_price: # 숏에 대한 진입이 되면 최고 가격 갱신, 이후 확장갭으로 적용
+                condition1 = float(live24data['highest_short_price'])*(1+live24data['short_gap_rate'])<close_price
+                if account == 'Sub10':
+                    condition2 = reentry_filter
+                    condition3 = entry_level < close_price
+                else:   
+                    condition2 = 0
+                    condition3 = 0
+                if condition1 or (condition2 and condition3):
                     try:  # cycle_entry_filter_hysteresis 추세일때만 진입하는 조건문 추가 예정
-                        orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_take_profit,1), timeInForceValue='normal')
-                        time.sleep(5)
-                        print("short entry/triggerPrice:{}".format(sorted_sell_orders['triggerPrice']))
+                        print("short entry/triggerPrice:{}".format(float(close_price)))
+                        time.sleep(60)
                         myutil2.live24flag('highest_short_price',filename2,float(close_price))
+                        orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_take_profit,1), timeInForceValue='normal')
                         profit=exit_alarm_enable(avg_price,close_price,position_side)
                     except:
                         message="[free:{}][{}_{}_{}][{}][{}][size:{}]물량투입 실패:{}USD->cancel all orders".format(free,account,coin,position_side,close_price,profit,round(bet_size,8),total_div4)
@@ -884,7 +1021,14 @@ if __name__ == "__main__":
                 print("lowest_long_price:{}*(1-{}:{}):{}>close_price:{}".format(live24data['lowest_long_price'],live24data['long_gap_rate'],1-live24data['long_gap_rate'],live24data['lowest_long_price']*(1-live24data['long_gap_rate']),close_price))
                 if live24data['short_position_running']:
                     print("short_profit:{} > alpha*100:{}".format(short_profit, alpha*100))
-                if float(live24data['lowest_long_price'])*(1-live24data['long_gap_rate'])>close_price:
+                condition1 = float(live24data['lowest_long_price'])*(1-live24data['long_gap_rate'])>close_price
+                if account == 'Sub10':
+                    condition2 = reentry_filter
+                    condition3 = entry_level > close_price
+                else:   
+                    condition2 = 0
+                    condition3 = 0
+                if condition1 or (condition2 and condition3):
                     if free > 1:  #cycle_entry_filter_hysteresis # cycle_entry_filter_hysteresis 추세일때만 진입하는 조건문 추가 예정
                         if account == 'Sub10': #short 포지션이 있고, short_profit이 alpha*100보다 클때만 진입, 다른 계정은 물려있어 해소 될때까지 진입 금지 
                             try:
@@ -988,7 +1132,11 @@ if __name__ == "__main__":
                             pre_short_count = live24data['sell_orders_count']
                 else:
                     print("short 최저점 조정 남은 시간:{}".format(return_true_after_minutes(timeout,live24data['short_entry_time'])[1]))
-
+           
+            # 포지션 조정효율 떨어지는 것은 리스크로 봐야한다. (손절 관련 로직 넣을껏)
+            # APAE 인데. 실시간 피드백이 아니므로. 조정후 다시 체크해야한다. 예방 주사 개념  calc_APAE (로테이트 방식)
+            # 손실률 / 투입 비율 컷 감안 -5% / 65%
+            # 변동성에 따른 변동 갭 필요함 
 
             elif position_side == 'long':
                 if return_true_after_minutes(timeout,live24data['long_entry_time'])[0]:
