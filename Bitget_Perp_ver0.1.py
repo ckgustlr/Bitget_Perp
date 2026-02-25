@@ -608,7 +608,7 @@ if __name__ == "__main__":
     short_profit_line = 0.99 # 기타줄 초기 레벨
     short_profit_line_adjust = 0.999 # 1% 넘었을때 close_price 기준으로 세팅갭 0.1%
     long_profit_line = 1.01 # 기타줄 초기 레벨
-    long_profit_line_adjust = 1.011 # 1% 넘었을때 close_price 기준으로 세팅갭 0.1%
+    long_profit_line_adjust = 1.001 # 1% 넘었을때 close_price 기준으로 세팅갭 0.1%
 
 
     if coin == 'QQQUSDT':
@@ -803,7 +803,6 @@ if __name__ == "__main__":
             live24 = live24_backup
 
         print("exit_interval:", exit_interval)
-        timeout = exit_interval # 9분마다 1% 기타줄 세팅 무식해..ㅋ 
         position = positionApi.all_position(marginCoin='USDT', productType='USDT-FUTURES')
         long_take_profit = live24data['long_take_profit'] #1.001 #live24data['long_take_profit']
         short_take_profit = live24data['short_take_profit'] #0.999 #live24data['short_take_profit']
@@ -872,6 +871,7 @@ if __name__ == "__main__":
         exit_interval = exit_interval / adjustment_count
         MIN_EXIT_INTERVAL = 10  # bars or cycles
         exit_interval = round(max(exit_interval, MIN_EXIT_INTERVAL))
+        timeout = exit_interval # 9분마다 1% 기타줄 세팅 무식해..ㅋ 
 
         # exit_interval_raw=1374
         # adjustment_count=22
