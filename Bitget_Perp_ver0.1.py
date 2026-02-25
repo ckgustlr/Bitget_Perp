@@ -407,12 +407,81 @@ def compute_T_control(
 
     return int(round(T))
 
+def calc_exit_levels(
+    price: float,
+    atr: float,
+    remaining_count: int,
+    base_profit: float = 0.01,      # 1% 최소 이익
+    vol_min: float = 0.5,
+    vol_max: float = 2.0
+):
+    """
+    가변 Exit Interval 계산 함수
+
+    :param price: 현재 가격
+    :param atr: ATR 값 (같은 타임프레임)
+    :param remaining_count: 남은 exit count (기타줄 수)
+    :param base_profit: 최소 이익 비율 (0.01 = 1%)
+    :param vol_min: 변동성 하한 clamp
+    :param vol_max: 변동성 상한 clamp
+    :return: exit_levels (list of profit ratios)
+    """
+
+    if remaining_count <= 0:
+        return []
+
+    # 1️⃣ 상대 변동성 계산
+    raw_vol_factor = atr / price
+
+    # 2️⃣ 변동성 clamp
+    vol_factor = max(vol_min, min(raw_vol_factor, vol_max))
+
+    # 3️⃣ 이번 사이클 최대 이익 목표
+    max_profit = base_profit * vol_factor
+
+    # 4️⃣ exit level 생성 (base → max)
+    exit_levels = np.linspace(
+        base_profit,
+        max_profit,
+        remaining_count
+    )
+
+    return exit_levels.tolist()
+
+def cycle_entry_filter_hysteresis(
+    side: str,
+    profit: float,
+    adjusted_alpha: float,
+    trend_strength: float,
+    enter_eps: float = 0.05,
+    exit_eps: float = 0.02,
+    in_position: bool = False,
+) -> bool:
+    """
+    진입/유지 히스테리시스 포함 필터
+    """
+
+    if profit <= adjusted_alpha:
+        return False
+
+    if side == "long":
+        threshold = exit_eps if in_position else enter_eps
+        return trend_strength > threshold
+
+    elif side == "short":
+        threshold = -exit_eps if in_position else -enter_eps
+        return trend_strength < threshold
+
+    else:
+        raise ValueError("side must be 'long' or 'short'")
+
 if __name__ == "__main__":
     cnt=0
     cntm=0
     minute=0
     minutem=0
-    pre_count=0
+    pre_short_count=0
+    pre_long_count=0
     pre_set_lev = 0
     long_flag = False
     short_flag = False
@@ -529,22 +598,22 @@ if __name__ == "__main__":
             "quote_volume"
         ]
         df = pd.DataFrame(data, columns=cols)
-        current_atr = calculate_atr(df, period=14)
+        atr = calculate_atr(df, period=14)
 
         for c in ["open", "high", "low", "close", "volume", "quote_volume"]:
             df[c] = df[c].astype(float)
 
         df["open_time"] = df["open_time"].astype("int64")
-        T_market = trend_strength(df, current_atr, span=21)
-        close_price = df["close"].iloc[-1]
-        print(f"현재 1시간봉 ATR/close_price: {current_atr/close_price}") 
+        T_market = trend_strength(df, atr, span=21)
+        price = df["close"].iloc[-1]
+        print(f"현재 1시간봉 ATR/close_price: {atr/price}") 
         print("T_market Trend Strength:", T_market) 
 
         hedge_pnl = 0.2 
         free_margin = 500
         used_margin = 1500
 
-        alpha = current_atr/close_price
+        alpha = atr/price
         
         gap_hist = [0.012, 0.014] # 예시
         
@@ -589,10 +658,10 @@ if __name__ == "__main__":
         )
 
         alpha_scale = get_alpha(symbol, state)
-        alpha = (current_atr / close_price) * alpha_scale
+        alpha = (atr / price) * alpha_scale
 
         print(f"Market State: {state}, Alpha Scale: {alpha_scale}, Adjusted Alpha*100: {alpha*100}%")
-        print(f"Gap (price): {close_price * alpha}")
+        print(f"Gap (price): {price * alpha}")
 
         chgUtc = float(marketApi.ticker(symbol,'USDT-FUTURES')['data'][0]['changeUtc24h'])*100
         chgUtcWoAbs = chgUtc
@@ -618,10 +687,15 @@ if __name__ == "__main__":
         else:
             live24 = live24_backup
 
+        short_profit = live24data['short_profit'] #1.001 #live24data['long_take_profit']
+        long_profit = live24data['long_profit'] #0.999 #live24data['short_take_profit']
+
         if position_side == 'short':
             current_scale_index = live24data['sell_orders_count']
+
         elif position_side == 'long':
             current_scale_index = live24data['buy_orders_count']
+
         adjustment_count = current_scale_index + 1  # 1 ~ N
 
         exit_interval = exit_interval / adjustment_count
@@ -632,11 +706,17 @@ if __name__ == "__main__":
         # adjustment_count=22
         # exit_interval_final=53
 
+        exit_levels = calc_exit_levels(
+            price=price,
+            atr=atr,
+            remaining_count=current_scale_index
+        )
+
+        print(exit_levels)
+
         print("exit_interval:", exit_interval)
         timeout = exit_interval # 9분마다 1% 기타줄 세팅 무식해..ㅋ 
         position = positionApi.all_position(marginCoin='USDT', productType='USDT-FUTURES')
-        short_profit = live24data['short_profit'] #1.001 #live24data['long_take_profit']
-        long_profit = live24data['long_profit'] #0.999 #live24data['short_take_profit']
         long_take_profit = live24data['long_take_profit'] #1.001 #live24data['long_take_profit']
         short_take_profit = live24data['short_take_profit'] #0.999 #live24data['short_take_profit']
         try:
@@ -650,7 +730,7 @@ if __name__ == "__main__":
             if position_side == 'short':
                 print("short Positon not found/long_profit > alpha*100: {}/{}".format(long_profit, alpha*100))
                 myutil2.live24flag('short_position_running',filename2,False)
-                if long_profit > alpha*100:
+                if long_profit > alpha*100 and T_market > 0.05: #can_enter_short and 0: #확실히 long 추세확인하고 진입 
                     orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_profit_line,1), timeInForceValue='normal')
                     myutil2.live24flag('highest_short_price',filename2,float(close_price))
                     message="[{}]1st Market Short Entry".format(account)
@@ -659,7 +739,7 @@ if __name__ == "__main__":
             elif position_side == 'long':
                 print("long Positon not found/short_profit > alpha*100: {}/{}".format(short_profit, alpha*100))
                 myutil2.live24flag('long_position_running',filename2,False)
-                if short_profit > alpha*100:
+                if short_profit > alpha*100 and T_market < -0.05: #can_enter_long and 0: # 확실히 short 추세확인하고 진입
                     orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='buy', tradeSide='open', marginMode='isolated', productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*long_profit_line,1), timeInForceValue='normal')
                     myutil2.live24flag('lowest_long_price',filename2,float(close_price))
                     message="[{}]1st Market Long Entry".format(account)
@@ -769,20 +849,16 @@ if __name__ == "__main__":
                 if live24data['long_position_running']:
                     print("long_profit:{} > alpha*100:{}".format(long_profit, alpha*100))
                 print("highest_short_price:{}*(1+{}:{}):{}<close_price:{}".format(live24data['highest_short_price'],live24data['short_gap_rate'],1+live24data['short_gap_rate'],live24data['highest_short_price']*(1+live24data['short_gap_rate']),close_price))
-                if float(live24data['highest_short_price'])*(1+live24data['short_gap_rate'])<close_price:
-                    if  live24data['long_position_running'] and long_profit > alpha*100: #long 포지션이 있고, long_profit이 alpha*100보다 클때만 진입, 롱포지션이 없으면 long_profit는 이전에 마지막 exit 시점의 상태라 왜곡된다 
-                        try:
-                            #orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_take_profit,1), timeInForceValue='normal')
-                            time.sleep(5)
-                            # result = planApi.current_plan_v2(planType="profit_loss", productType="USDT-FUTURES")
-                            # sell_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'sell' and entry['symbol'] == symbol]
-                            # sorted_sell_orders = sorted(sell_orders, key=lambda x: float(x['triggerPrice']),reverse=True)[0]
-                            print("short entry/triggerPrice:{}".format(sorted_sell_orders['triggerPrice']))
-                            myutil2.live24flag('highest_short_price',filename2,float(close_price))
-                            profit=exit_alarm_enable(avg_price,close_price,position_side)
-                        except:
-                            message="[free:{}][{}_{}_{}][{}][{}][size:{}]물량투입 실패:{}USD->cancel all orders".format(free,account,coin,position_side,close_price,profit,round(bet_size,8),total_div4)
-                        minutem=0
+                if float(live24data['highest_short_price'])*(1+live24data['short_gap_rate'])<close_price: # 숏에 대한 진입이 되면 최고 가격 갱신, 이후 확장갭으로 적용
+                    try:  # cycle_entry_filter_hysteresis 추세일때만 진입하는 조건문 추가 예정
+                        orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_take_profit,1), timeInForceValue='normal')
+                        time.sleep(5)
+                        print("short entry/triggerPrice:{}".format(sorted_sell_orders['triggerPrice']))
+                        myutil2.live24flag('highest_short_price',filename2,float(close_price))
+                        profit=exit_alarm_enable(avg_price,close_price,position_side)
+                    except:
+                        message="[free:{}][{}_{}_{}][{}][{}][size:{}]물량투입 실패:{}USD->cancel all orders".format(free,account,coin,position_side,close_price,profit,round(bet_size,8),total_div4)
+                    minutem=0
 
             elif position_side == 'long':  # 포지션 롱일때
                 if liquidationPrice*LongSafeMargin>close_price:
@@ -809,15 +885,11 @@ if __name__ == "__main__":
                 if live24data['short_position_running']:
                     print("short_profit:{} > alpha*100:{}".format(short_profit, alpha*100))
                 if float(live24data['lowest_long_price'])*(1-live24data['long_gap_rate'])>close_price:
-                    if free > 1:
-                        if live24data['short_position_running'] and short_profit > alpha*100: #short 포지션이 있고, short_profit이 alpha*100보다 클때만 진입, 숏포지션이 없으면 short_profit는 이전에 마지막 exit 시점의 상태라 왜곡된다
+                    if free > 1:  #cycle_entry_filter_hysteresis # cycle_entry_filter_hysteresis 추세일때만 진입하는 조건문 추가 예정
+                        if account == 'Sub10': #short 포지션이 있고, short_profit이 alpha*100보다 클때만 진입, 다른 계정은 물려있어 해소 될때까지 진입 금지 
                             try:
                                 orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='buy', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), timeInForceValue='normal',presetStopSurplusPrice=round(close_price*long_take_profit,1))
                                 time.sleep(5)
-                                # result = planApi.current_plan_v2(planType="profit_loss", productType="USDT-FUTURES")
-                                # buy_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'buy' and entry['symbol'] == symbol]
-                                # sorted_buy_orders = sorted(buy_orders, key=lambda x: float(x['triggerPrice']))[0]
-                                # print("long entry/triggerPrice:{}".format(sorted_buy_orders['triggerPrice']))
                                 myutil2.live24flag('lowest_long_price',filename2,float(close_price))
                                 profit=exit_alarm_enable(avg_price,close_price,position_side)
                             except:
@@ -909,11 +981,11 @@ if __name__ == "__main__":
                         print("[{}/{}][{}/{}][{}/{}]".format(i,sorted_sell_orders['size'],trigger_price,type(trigger_price).__name__,sorted_sell_orders['triggerPrice'],type(sorted_sell_orders['triggerPrice']).__name__))
                         result = planApi.modify_tpsl_plan_v2(symbol=symbol2, marginCoin="USDT", productType="USDT-FUTURES", orderId=sorted_sell_orders['orderId'], triggerPrice=trigger_price,executePrice=trigger_price,size=sorted_sell_orders['size'])
                         time.sleep(1)
-                    if pre_count != live24data['sell_orders_count']:
+                    if pre_short_count != live24data['sell_orders_count']:
                         if profit > 0:
                             message = "[Short timeout:{}/count:{}][{}/{}]trigger_price:{}/gap:{}/last:{}]".format(timeout,i,live24data['short_absamount'],achievedProfits,round(trigger_price0,1),round(sell_orders_unitgap),round(sorted_sell_orders_last_price_1))
                             tg_send(message)
-                            pre_count = live24data['sell_orders_count']
+                            pre_short_count = live24data['sell_orders_count']
                 else:
                     print("short 최저점 조정 남은 시간:{}".format(return_true_after_minutes(timeout,live24data['short_entry_time'])[1]))
 
@@ -950,9 +1022,11 @@ if __name__ == "__main__":
                         print("[{}/{}][{}/{}][{}/{}]".format(i,sorted_buy_orders['size'],trigger_price,type(trigger_price).__name__,sorted_buy_orders['triggerPrice'],type(sorted_buy_orders['triggerPrice']).__name__))
                         result = planApi.modify_tpsl_plan_v2(symbol=symbol2, marginCoin="USDT", productType="USDT-FUTURES", orderId=sorted_buy_orders['orderId'], triggerPrice=trigger_price,executePrice=trigger_price,size=sorted_buy_orders['size'])
                         time.sleep(1)
-                    if profit > 0:
-                        message = "[Long timeout:{}/count:{}][{}/{}]trigger_price:{}/gap:{}/last:{}]".format(timeout,i,live24data['long_absamount'],achievedProfits,round(trigger_price0,1),round(buy_orders_unitgap),round(sorted_buy_orders_last_price_1))
-                        tg_send(message)
+                    if pre_long_count != live24data['buy_orders_count']:
+                        if profit > 0:
+                            message = "[Long timeout:{}/count:{}][{}/{}]trigger_price:{}/gap:{}/last:{}]".format(timeout,i,live24data['long_absamount'],achievedProfits,round(trigger_price0,1),round(buy_orders_unitgap),round(sorted_buy_orders_last_price_1))
+                            tg_send(message)
+                            pre_long_count = live24data['buy_orders_count']
                 else:
                     print("long 최고점 조정 남은 시간:{}".format(return_true_after_minutes(timeout,live24data['long_entry_time'])[1]))
 
