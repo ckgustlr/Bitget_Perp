@@ -1278,17 +1278,17 @@ if __name__ == "__main__":
                             message = "[Short timeout:{}/count:{}][{}/{}]trigger_price:{}/gap:{}/last:{}]".format(timeout,i,live24data['short_absamount'],achievedProfits,round(trigger_price0,1),round(sell_orders_unitgap),round(sorted_sell_orders_last_price_1))
                             tg_send(message)
                             pre_short_count = live24data['sell_orders_count']
-                    usable_range = calc_usable_range(
-                        liq_price=live24data['long_liquidationPrice'],
-                        current_price=close_price,
-                        side="short"
-                    )
-                    factor = dynamic_profit_factor_v2(
-                        vol=vol,
-                        phase=T_market,
-                        usable_range=usable_range
-                    )
-                    tg_send(factor)
+                            usable_range = calc_usable_range(
+                                liq_price=live24data['long_liquidationPrice'],
+                                current_price=close_price,
+                                side="short"
+                            )
+                            factor = dynamic_profit_factor_v2(
+                                vol=vol,
+                                phase=T_market,
+                                usable_range=usable_range
+                            )
+                            tg_send(factor)
                 else:
                     print("short 최저점 조정 남은 시간:{}".format(return_true_after_minutes(timeout,live24data['short_entry_time'])[1]))
            
@@ -1345,17 +1345,17 @@ if __name__ == "__main__":
                             message = "[Long timeout:{}/count:{}][{}/{}]trigger_price:{}/gap:{}/last:{}]".format(timeout,i,live24data['long_absamount'],achievedProfits,round(trigger_price0,1),round(buy_orders_unitgap),round(sorted_buy_orders_last_price_1))
                             tg_send(message)
                             pre_long_count = live24data['buy_orders_count']
-                    usable_range = calc_usable_range(
-                        liq_price=live24data['short_liquidationPrice'],
-                        current_price=close_price,
-                        side="long"
-                    )
-                    factor = dynamic_profit_factor_v2(
-                        vol=vol,
-                        phase=T_market,
-                        usable_range=usable_range
-                    )
-                    tg_send(factor)
+                            usable_range = calc_usable_range(
+                                liq_price=live24data['short_liquidationPrice'],
+                                current_price=close_price,
+                                side="long"
+                            )
+                            factor = dynamic_profit_factor_v2(
+                                vol=vol,
+                                phase=T_market,
+                                usable_range=usable_range
+                            )
+                            tg_send(factor)
                 else:
                     print("long 최고점 조정 남은 시간:{}".format(return_true_after_minutes(timeout,live24data['long_entry_time'])[1]))
 
