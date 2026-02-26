@@ -2,10 +2,12 @@
 from pickle import TRUE
 import subprocess
 import time
+from copy import deepcopy
 import datetime
 #from datetime import datetime, timezone, timedelta 
 import requests
 import json
+from pathlib import Path
 import ccxt
 from telegram import Bot
 import asyncio
@@ -591,6 +593,114 @@ def get_next_entry_level(
 
     return round(result_price, 4)
 
+def make_position_state(avg_price: float, size: float):
+    return {
+        "avg_price": avg_price,
+        "size": size,
+        "notional": avg_price * size
+    }
+
+def rotate_position(snapshot: dict, side: str, new_avg: float, new_size: float):
+    assert side in ("short", "long")
+
+    current = snapshot[side]["cur"]
+
+    # cur → prev
+    if current is not None:
+        snapshot[side]["prev"] = deepcopy(current)
+
+    # new cur
+    snapshot[side]["cur"] = make_position_state(new_avg, new_size)
+
+    snapshot["timestamp"] = int(time.time())
+
+def calc_APAE(snapshot: dict):
+
+    long_cur = snapshot["long"]["cur"]
+    short_cur = snapshot["short"]["cur"]
+    capital = snapshot["capital"]
+    market = snapshot["market"]
+
+    # 1. 질량 비대칭
+    size_gap = long_cur["size"] - short_cur["size"]
+
+    # 2. 평단 갭
+    avg_gap = short_cur["avg_price"] - long_cur["avg_price"]
+
+    # 3. 외부 유입 완충
+    effective_equity = (
+        capital["core"]
+        + capital["recycled"]
+        + capital["external_inflow"] * 0.3
+    )
+
+    free_ratio = capital["free"] / effective_equity
+
+    # 4. 변동성 가중치
+    volatility_weight = 1 + market["volatility"]
+
+    # 5. APAE score
+    apae_score = (
+        abs(size_gap) * 0.4 +
+        abs(avg_gap / market["current_price"]) * 0.3 +
+        (1 - free_ratio) * 0.3
+    ) * volatility_weight
+
+    return {
+        "size_gap": size_gap,
+        "avg_gap": avg_gap,
+        "free_ratio": free_ratio,
+        "APAE_score": round(apae_score, 6)
+    }
+
+def load_snapshot(position_json):
+    with open(position_json, "r") as f:
+        return json.load(f)
+
+def save_snapshot(snapshot, position_json):
+    with open(position_json, "w") as f:
+        json.dump(snapshot, f, indent=2)
+
+def dynamic_profit_factor_v2(
+    vol,
+    phase,
+    base=1.0,
+    usable_range=0.06,      # 6% 실질 공간
+    vol_ref=0.01,
+    vol_weight=0.6,
+    phase_weight=0.8,
+    curvature=1.5,         # 비선형 강도
+    min_factor=0.94,       # 최대 6% 당김
+    max_factor=1.02
+):
+    """
+    vol   : ATR / price
+    phase : 0~1 정규화된 trend_strength
+    """
+
+    # 1️⃣ 공격성 점수 (0~1 이상 가능)
+    raw_aggression = (
+        vol_weight * (vol / vol_ref) +
+        phase_weight * phase
+    )
+
+    # 2️⃣ 비선형 증폭 (불태우기 구간에서 급격)
+    aggression = np.tanh(raw_aggression ** curvature)
+
+    # 3️⃣ 실제 가격 공간으로 변환
+    factor = base - usable_range * aggression
+
+    return float(np.clip(factor, min_factor, max_factor))
+
+def calc_usable_range(liq_price, current_price, side="short"):
+    if side == "short":
+        raw = (liq_price - current_price) / liq_price
+    else:  # long
+        raw = (current_price - liq_price) / current_price
+
+    # 음수 방지 + 하한선
+    return max(0.0, raw)
+
 if __name__ == "__main__":
     cnt=0
     cntm=0
@@ -670,6 +780,7 @@ if __name__ == "__main__":
 
     filename2  = coin+'_'+account+'.json'
     filename  = account+'.json'
+    position_json = coin+'_'+account+'_position.json'
 
     # Load API credentials from environment variables
     api_key, secret_key, passphrase = get_exchange_credentials(account)
@@ -721,7 +832,8 @@ if __name__ == "__main__":
         df["open_time"] = df["open_time"].astype("int64")
         T_market = trend_strength(df, atr, span=21)
         price = df["close"].iloc[-1]
-        print(f"현재 1시간봉 ATR/close_price: {atr/price}") 
+        vol = atr/price
+        print(f"현재 1시간봉 ATR/close_price: {vol}") 
         print("T_market Trend Strength:", T_market) 
 
         hedge_pnl = 0.2 
@@ -801,6 +913,19 @@ if __name__ == "__main__":
             live24_backup=live24
         else:
             live24 = live24_backup
+        
+        snapshot = load_snapshot(position_json)
+
+        # 예: long 포지션 증량
+        #rotate_position(snapshot, "long", new_avg=42100, new_size=0.9)
+
+        snapshot["capital"]["core"] = 500
+        snapshot["capital"]["recycled"] = free
+        snapshot["capital"]["external_inflow"] = 0 
+        snapshot["capital"]["free"] = free
+        snapshot["timestamp"] = time.time()
+        snapshot["market"]["current_price"] = close_price
+        snapshot["market"]["volatility"] = vol
 
         print("exit_interval:", exit_interval)
         position = positionApi.all_position(marginCoin='USDT', productType='USDT-FUTURES')
@@ -883,7 +1008,7 @@ if __name__ == "__main__":
             remaining_count=current_scale_index
         )
 
-        print(exit_levels)
+        #print(exit_levels)
 
 
  #       print("close_price:{}/avg_price:{}".format(close_price,avg_price))
@@ -989,9 +1114,12 @@ if __name__ == "__main__":
                 if condition1 or (condition2 and condition3):
                     try:  # cycle_entry_filter_hysteresis 추세일때만 진입하는 조건문 추가 예정
                         print("short entry/triggerPrice:{}".format(float(close_price)))
-                        time.sleep(60)
                         myutil2.live24flag('highest_short_price',filename2,float(close_price))
                         orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_take_profit,1), timeInForceValue='normal')
+                        time.sleep(5)
+                        position = positionApi.all_position(marginCoin='USDT', productType='USDT-FUTURES')['data'][idx]
+                        avg_price = round(float(position['openPriceAvg']),3)
+                        rotate_position(snapshot, position_side, new_avg=avg_price, new_size=bet_size)
                         profit=exit_alarm_enable(avg_price,close_price,position_side)
                     except:
                         message="[free:{}][{}_{}_{}][{}][{}][size:{}]물량투입 실패:{}USD->cancel all orders".format(free,account,coin,position_side,close_price,profit,round(bet_size,8),total_div4)
@@ -1034,11 +1162,21 @@ if __name__ == "__main__":
                             try:
                                 orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='buy', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), timeInForceValue='normal',presetStopSurplusPrice=round(close_price*long_take_profit,1))
                                 time.sleep(5)
+                                position = positionApi.all_position(marginCoin='USDT', productType='USDT-FUTURES')['data'][idx]
+                                avg_price = round(float(position['openPriceAvg']),3)
+                                rotate_position(snapshot, position_side, new_avg=avg_price, new_size=bet_size)
                                 myutil2.live24flag('lowest_long_price',filename2,float(close_price))
                                 profit=exit_alarm_enable(avg_price,close_price,position_side)
                             except:
                                 message="[free:{}][{}_{}_{}][{}][{}][size:{}]물량투입 실패:{}USD->cancel all orders".format(free,account,coin,position_side,close_price,profit,round(bet_size,8),total_div4)
                                 minutem=0
+
+            result = calc_APAE(snapshot)
+
+            print("=== APAE RESULT ===")
+            print(result)
+
+            save_snapshot(snapshot, position_json)
 
             print("count:{}".format(cnt))
             time.sleep(10)
@@ -1095,7 +1233,17 @@ if __name__ == "__main__":
 
             if position_side == 'short':
                 if return_true_after_minutes(timeout,live24data['short_entry_time'])[0]:   # 30분 마다 1% 이익 세팅
-                    myutil2.live24flag('short_entry_time',filename2,time.time())
+                    # myutil2.live24flag('short_entry_time',filename2,time.time())
+                    # usable_range = calc_usable_range(
+                    #     liq_price=live24data['long_liquidationPrice'],
+                    #     current_price=close_price,
+                    #     side="short"
+                    # )
+                    # factor = dynamic_profit_factor_v2(
+                    #     vol=vol,
+                    #     phase=T_market,
+                    #     usable_range=usable_range
+                    # )
                     result = planApi.current_plan_v2(planType="profit_loss", productType="USDT-FUTURES")
 
                     sell_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'sell' and entry['symbol'] == symbol]
@@ -1130,17 +1278,39 @@ if __name__ == "__main__":
                             message = "[Short timeout:{}/count:{}][{}/{}]trigger_price:{}/gap:{}/last:{}]".format(timeout,i,live24data['short_absamount'],achievedProfits,round(trigger_price0,1),round(sell_orders_unitgap),round(sorted_sell_orders_last_price_1))
                             tg_send(message)
                             pre_short_count = live24data['sell_orders_count']
+                    usable_range = calc_usable_range(
+                        liq_price=live24data['long_liquidationPrice'],
+                        current_price=close_price,
+                        side="short"
+                    )
+                    factor = dynamic_profit_factor_v2(
+                        vol=vol,
+                        phase=T_market,
+                        usable_range=usable_range
+                    )
+                    tg_send(factor)
                 else:
                     print("short 최저점 조정 남은 시간:{}".format(return_true_after_minutes(timeout,live24data['short_entry_time'])[1]))
            
-            # 포지션 조정효율 떨어지는 것은 리스크로 봐야한다. (손절 관련 로직 넣을껏)
-            # APAE 인데. 실시간 피드백이 아니므로. 조정후 다시 체크해야한다. 예방 주사 개념  calc_APAE (로테이트 방식)
+
+            # APAE 인데. 실시간 피드백이 아니므로. 조정후 다시 체크해야한다. 예방 주사 개념  calc_APAE (로테이트 방식) -> 포지션 투입하여 JSON 관찰필요 
+            # -> 포지션 조정효율 떨어지는 것은 리스크로 봐야한다. (손절 관련 로직 넣을껏) 여기에 
             # 손실률 / 투입 비율 컷 감안 -5% / 65%
-            # 변동성에 따른 변동 갭 필요함 
+            # 변동성에 따른 변동 갭 필요함  -> 적용했으나 팩터 체크해야함  
 
             elif position_side == 'long':
                 if return_true_after_minutes(timeout,live24data['long_entry_time'])[0]:
                     myutil2.live24flag('long_entry_time',filename2,time.time())
+                    # usable_range = calc_usable_range(
+                    #     liq_price=live24data['short_liquidationPrice'],
+                    #     current_price=close_price,
+                    #     side="long"
+                    # )
+                    # factor = dynamic_profit_factor_v2(
+                    #     vol=vol,
+                    #     phase=T_market,
+                    #     usable_range=usable_range
+                    # )
                     result = planApi.current_plan_v2(planType="profit_loss", productType="USDT-FUTURES")
 
                     buy_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'buy' and entry['symbol'] == symbol]
@@ -1175,6 +1345,17 @@ if __name__ == "__main__":
                             message = "[Long timeout:{}/count:{}][{}/{}]trigger_price:{}/gap:{}/last:{}]".format(timeout,i,live24data['long_absamount'],achievedProfits,round(trigger_price0,1),round(buy_orders_unitgap),round(sorted_buy_orders_last_price_1))
                             tg_send(message)
                             pre_long_count = live24data['buy_orders_count']
+                    usable_range = calc_usable_range(
+                        liq_price=live24data['short_liquidationPrice'],
+                        current_price=close_price,
+                        side="long"
+                    )
+                    factor = dynamic_profit_factor_v2(
+                        vol=vol,
+                        phase=T_market,
+                        usable_range=usable_range
+                    )
+                    tg_send(factor)
                 else:
                     print("long 최고점 조정 남은 시간:{}".format(return_true_after_minutes(timeout,live24data['long_entry_time'])[1]))
 
