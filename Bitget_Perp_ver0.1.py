@@ -1,5 +1,6 @@
 #-*-coding:utf-8-*-
 from pickle import TRUE
+from collections import deque
 import subprocess
 import time
 from copy import deepcopy
@@ -122,8 +123,8 @@ def get_pos_index(live24, symbol, position_side):
     # Raise an exception if no matching index is found
     raise ValueError(f"No matching position found for symbol: {symbol}, position_side: {position_side}")
 
-def return_true_after_minutes(minute,timestamp):
-    target_timestamp = timestamp + (minute * 60)  # n분 후의 타임스탬프 계산
+def return_true_after_minutes(delay_sec,timestamp):
+    target_timestamp = timestamp + delay_sec  # n초 후의 타임스탬프 계산
     if time.time() > target_timestamp:
         ret=1
         diff= target_timestamp-time.time()
@@ -132,6 +133,17 @@ def return_true_after_minutes(minute,timestamp):
         diff= target_timestamp-time.time()
     return ret,diff
 
+def apply_gap_velocity(base_factor, gap_v):
+    """
+    gap_v > 0 : 여유 공간이 늘고 있음 → 조금 더 욕심 가능
+    gap_v < 0 : 공간이 줄고 있음 → 즉시 보수화
+    """
+
+    adjustment = -gap_v * 5  # 감도 계수 (튜닝 포인트)
+
+    adjusted = base_factor + adjustment 
+
+    return max(0.90, min(adjusted, 0.98))
 
 def short_action(action):
     """
@@ -321,6 +333,25 @@ def trend_strength(df, atr, span=21):
     # ATR로 정규화
     strength = slope / atr
     return strength
+
+def trend_strength_normalized(df, atr, span=21):
+    """
+    추세 강도 (0 ~ 1 정규화)
+    EMA 기울기를 ATR 대비 정규화
+    """
+    if len(df) < span + 2 or atr == 0:
+        return 0.0
+
+    ema = df["close"].ewm(span=span, adjust=False).mean()
+
+    slope = ema.iloc[-1] - ema.iloc[-2]
+
+    raw_strength = abs(slope) / atr
+
+    # 0.15 이상은 강한 추세로 간주
+    normalized = min(raw_strength / 0.15, 1.0)
+
+    return normalized
     
 def calculate_atr(df: pd.DataFrame, period: int = 14):
     if df is None or len(df) <= period:
@@ -346,6 +377,10 @@ def get_alpha(symbol, state):
     #alpha_key = STATE_TO_ALPHA_KEY[symbol][state]
     return ALPHA_TABLE[symbol][state]["alpha"]
 
+def calc_gap_ratio(current_price, liquidation_price, factor):
+    anchor = liquidation_price * factor
+    return abs(anchor - current_price) / current_price
+
 def gap_velocity(gap_hist, window=3):
     """
     gap_hist: list or deque of gap values (float)
@@ -359,6 +394,24 @@ def gap_velocity(gap_hist, window=3):
         for i in range(-window + 1, 0)
     ]
     return sum(diffs) / len(diffs)
+
+def compute_T_control2(
+    T_base,
+    gap_sensor,
+    hedge_sensor,
+    account_stress,
+    alpha,
+    T_min,
+    T_max
+):
+    stress = (
+        0.5 * gap_sensor +
+        0.3 * hedge_sensor +
+        0.2 * account_stress
+    )
+
+    T = T_base * (1 - alpha * stress)
+    return np.clip(T, T_min, T_max)
 
 def compute_T_control(
     T_base,
@@ -409,24 +462,28 @@ def compute_T_control(
 
     return int(round(T))
 
+import numpy as np
+
 def calc_exit_levels(
     price: float,
     atr: float,
     remaining_count: int,
-    base_profit: float = 0.01,      # 1% 최소 이익
+    side: str,                       # "long" | "short"
+    trend_strength: float,           # 0 ~ 1 (현재는 곡률에만 사용)
+    profit_ceiling: float,           # 🔥 외부에서 계산된 최종 목표 수익률
+    base_profit: float = 0.01,        # 항상 유지되는 최소 1%
     vol_min: float = 0.5,
-    vol_max: float = 2.0
+    vol_max: float = 2.0,
+    profit_mul_min: float = 1.0,
+    profit_mul_max: float = 5.0,      # 하드 캡 (최대 5%)
+    curve_max: float = 2.5
 ):
     """
-    가변 Exit Interval 계산 함수
-
-    :param price: 현재 가격
-    :param atr: ATR 값 (같은 타임프레임)
-    :param remaining_count: 남은 exit count (기타줄 수)
-    :param base_profit: 최소 이익 비율 (0.01 = 1%)
-    :param vol_min: 변동성 하한 clamp
-    :param vol_max: 변동성 상한 clamp
-    :return: exit_levels (list of profit ratios)
+    가변 Exit Price 레벨 생성 함수
+    - 최소 1% 이익은 항상 유지
+    - 추세 폭발 시 외부에서 profit_ceiling 확장 가능 (최대 5%)
+    - 가격 기준으로 실제 exit price 반환
+    - 소수점 첫째 자리까지 반올림
     """
 
     if remaining_count <= 0:
@@ -434,21 +491,38 @@ def calc_exit_levels(
 
     # 1️⃣ 상대 변동성 계산
     raw_vol_factor = atr / price
+    vol_factor = np.clip(raw_vol_factor, vol_min, vol_max)
 
-    # 2️⃣ 변동성 clamp
-    vol_factor = max(vol_min, min(raw_vol_factor, vol_max))
+    # 2️⃣ profit ceiling 안전 클램프
+    min_profit = base_profit * profit_mul_min
+    max_profit = base_profit * profit_mul_max
 
-    # 3️⃣ 이번 사이클 최대 이익 목표
-    max_profit = base_profit * vol_factor
-
-    # 4️⃣ exit level 생성 (base → max)
-    exit_levels = np.linspace(
-        base_profit,
-        max_profit,
-        remaining_count
+    profit_ceiling = np.clip(
+        profit_ceiling * vol_factor,
+        min_profit,
+        max_profit
     )
 
-    return exit_levels.tolist()
+    # 3️⃣ 곡률 계수 (추세 강할수록 뒤쪽 확장)
+    curve_power = 1.0 + trend_strength * (curve_max - 1.0)
+
+    x = np.linspace(0, 1, remaining_count)
+    curve = x ** curve_power
+
+    profit_levels = base_profit + curve * (profit_ceiling - base_profit)
+
+    # 4️⃣ 가격 레벨 변환
+    if side.lower() == "short":
+        exit_prices = price * (1 - profit_levels)
+    elif side.lower() == "long":
+        exit_prices = price * (1 + profit_levels)
+    else:
+        raise ValueError("side must be 'long' or 'short'")
+
+    # 5️⃣ 소수점 첫째 자리 반올림
+    exit_prices = [round(p, 1) for p in exit_prices]
+
+    return exit_prices
 
 def cycle_entry_filter_hysteresis(
     side: str,
@@ -661,6 +735,55 @@ def save_snapshot(snapshot, position_json):
     with open(position_json, "w") as f:
         json.dump(snapshot, f, indent=2)
 
+def calc_usable_range(current_price, liquidation_price, side):
+    """
+    side: 'long' or 'short'
+    """
+    if side == 'long':
+        # long은 청산가가 아래
+        return (current_price - liquidation_price) / current_price
+    else:
+        # short는 청산가가 위
+        return (liquidation_price - current_price) / current_price
+
+def dynamic_factor(
+    usable_range: float,
+    phase: float,
+    vol: float,
+    min_factor=0.90,
+    max_factor=0.98
+):
+    """
+    usable_range : 청산까지 남은 상대 거리
+    phase        : T_market (0~1 권장)
+    vol          : ATR / price
+    """
+
+    # 시장 압력
+    pressure = phase * vol
+
+    # 핵심 로직
+    raw = 1 - usable_range * (0.4 + 0.6 * pressure)
+
+    # 안전 클램프
+    return max(min_factor, min(raw, max_factor))
+
+def calc_anchor_price(liquidation_price, factor, side):
+    """
+    liquidation_price : 거래소 기준 청산가
+    factor            : dynamic_factor 결과
+    side              : 'long' or 'short'
+    """
+    if side == 'long':
+        # long은 청산가보다 위쪽으로
+        return liquidation_price * (2 - factor)
+    else:
+        # short는 청산가보다 아래쪽으로
+        return liquidation_price * factor
+
+def calc_gap_ratio(current_price, anchor_price):
+    return abs(anchor_price - current_price) / current_price
+
 def dynamic_profit_factor_v2(
     vol,
     phase,
@@ -700,6 +823,62 @@ def calc_usable_range(liq_price, current_price, side="short"):
 
     # 음수 방지 + 하한선
     return max(0.0, raw)
+
+def calc_expansion_score(
+    trend_strength,
+    ratio,              # T_control / abs(T_market)
+    account_stress,
+    hedge_sensor
+):
+    """
+    0 ~ 1 사이 확장 점수
+    """
+
+    # 추세가 강할수록 ↑
+    trend_component = trend_strength
+
+    # 시장이 빠를수록 (ratio < 1) 추세 가능성 ↑
+    speed_component = np.clip(1 - ratio, 0, 1)
+
+    # 계좌 안정적일수록 ↑
+    stability_component = np.clip(1 - account_stress, 0, 1)
+
+    # 헤지가 약할수록 (진짜 방향 노출) ↑
+    exposure_component = np.clip(1 - hedge_sensor, 0, 1)
+
+    # 가중 평균
+    score = (
+        0.4 * trend_component +
+        0.2 * speed_component +
+        0.2 * stability_component +
+        0.2 * exposure_component
+    )
+
+    return np.clip(score, 0, 1)
+
+def calc_profit_multiplier(
+    base_profit,
+    expansion_score,
+    base_mul_min=1.0,
+    base_mul_max=1.5,
+    expansion_mul_max=5.0
+):
+    """
+    기본 1~1.5
+    확장 조건에서 최대 5까지
+    """
+
+    # 1️⃣ 기본 영역 (0 ~ 0.5)
+    if expansion_score < 0.5:
+        # 1.0 ~ 1.5 사이만 움직임
+        base_zone = expansion_score / 0.5
+        return base_mul_min + base_zone * (base_mul_max - base_mul_min)
+
+    # 2️⃣ 확장 영역 (0.5 ~ 1.0)
+    else:
+        expansion_zone = (expansion_score - 0.5) / 0.5
+        return base_mul_max + expansion_zone * (expansion_mul_max - base_mul_max)
+
 
 if __name__ == "__main__":
     cnt=0
@@ -812,6 +991,54 @@ if __name__ == "__main__":
     while True:
         close_price = float(marketApi.ticker(symbol,'USDT-FUTURES')['data'][0]['lastPr'])
         # 1. 데이터 가져오기 (충분한 데이터 확보를 위해 limit을 100 이상 권장)
+        chgUtc = float(marketApi.ticker(symbol,'USDT-FUTURES')['data'][0]['changeUtc24h'])*100
+        chgUtcWoAbs = chgUtc
+        balances = accountApi.account(coin,'USDT-FUTURES', marginCoin=marginC)
+        #print(balances)
+        free = float(balances['data']['available'])
+        total = float(balances['data']['usdtEquity'])
+        total_div4 = round(float(balances['data']['usdtEquity'])/2,1)  # temporary 이더 최소 분해능이 안나온다 테스트후 2->4 원복 예정
+        amount=round(total/close_price,8)
+        freeamount=round(free/close_price,8)
+        cnt=cnt+1
+        cntm=cntm+1
+        live24data_condition = read_json(filename2)
+        if live24data_condition:
+            live24data = live24data_condition
+            live24data_backup=live24data
+        else:
+            live24data=live24data_backup
+        
+        condition = read_json(filename)
+        if condition:
+            live24 = condition
+            live24_backup=live24
+        else:
+            live24 = live24_backup
+        
+        snapshot = load_snapshot(position_json)
+
+        # 예: long 포지션 증량
+        #rotate_position(snapshot, "long", new_avg=42100, new_size=0.9)
+
+        position = positionApi.all_position(marginCoin='USDT', productType='USDT-FUTURES')
+        long_take_profit = live24data['long_take_profit'] #1.001 #live24data['long_take_profit']
+        short_take_profit = live24data['short_take_profit'] #0.999 #live24data['short_take_profit']
+        short_profit = live24data['short_profit'] #1.001 #live24data['long_take_profit']
+        long_profit = live24data['long_profit'] #0.999 #live24data
+
+        if position_side == 'short':
+            current_scale_index = live24data['sell_orders_count']
+            ankor_price= live24data['short_ankor_price']
+            Risk_Anchor= live24data['short_liquidationPrice']
+            Market_Stress_Anchor = live24data['long_liquidationPrice']
+
+        elif position_side == 'long':
+            current_scale_index = live24data['buy_orders_count']
+            ankor_price = live24data['long_ankor_price']
+            Risk_Anchor= live24data['long_liquidationPrice']
+            Market_Stress_Anchor = live24data['short_liquidationPrice']
+
         raw_data = marketApi.get_perp_candles("BTCUSDT", "1H", limit=100)
         data =raw_data['data']
         cols = [
@@ -831,26 +1058,131 @@ if __name__ == "__main__":
 
         df["open_time"] = df["open_time"].astype("int64")
         T_market = trend_strength(df, atr, span=21)
+        T_market_normalized = trend_strength_normalized(df, atr, span=21)
         price = df["close"].iloc[-1]
         vol = atr/price
         print(f"현재 1시간봉 ATR/close_price: {vol}") 
         print("T_market Trend Strength:", T_market) 
+        print(f"T_market_normalized: {T_market_normalized:.4f}")
 
-        hedge_pnl = 0.2 
-        free_margin = 500
-        used_margin = 1500
+        snapshot["capital"]["core"] = 500
+        snapshot["capital"]["recycled"] = free
+        snapshot["capital"]["external_inflow"] = 0 
+        snapshot["capital"]["free"] = free
+        snapshot["timestamp"] = time.time()
+        snapshot["market"]["current_price"] = close_price
+        snapshot["market"]["volatility"] = vol
 
         alpha = atr/price
-        
-        gap_hist = [0.012, 0.014] # 예시
-        
+
+        try:
+            idx = get_pos_index(position,coin,position_side)
+            if position_side == 'short':
+                myutil2.live24flag('short_position_running',filename2,True)
+            elif position_side == 'long':
+                myutil2.live24flag('long_positon_running',filename2,True)
+        except:
+            # 모두 포지션 재개 조건 충족시 가장 작은 사이즈로 진입
+            if position_side == 'short':
+                print("short Positon not found/long_profit > alpha*100: {}/{}".format(long_profit, alpha*100))
+                myutil2.live24flag('short_position_running',filename2,False)
+                if long_profit > alpha*100 and T_market > 0.05: #can_enter_short and 0: #확실히 long 추세확인하고 진입 
+                    orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_profit_line,1), timeInForceValue='normal')
+                    myutil2.live24flag('highest_short_price',filename2,float(close_price))
+                    myutil2.live24flag('short_ankor_price',filename2,float(close_price))
+                    message="[{}]1st Market Short Entry".format(account)
+                    tg_send(message)
+                    time.sleep(30)
+            elif position_side == 'long':
+                print("long Positon not found/short_profit > alpha*100: {}/{}".format(short_profit, alpha*100))
+                myutil2.live24flag('long_position_running',filename2,False)
+                if short_profit > alpha*100 and T_market < -0.05: #can_enter_long and 0: # 확실히 short 추세확인하고 진입
+                    orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='buy', tradeSide='open', marginMode='isolated', productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*long_profit_line,1), timeInForceValue='normal')
+                    myutil2.live24flag('lowest_long_price',filename2,float(close_price))
+                    myutil2.live24flag('long_ankor_price',filename2,float(close_price))
+                    message="[{}]1st Market Long Entry".format(account)
+                    tg_send(message)
+                    time.sleep(30)
+            time.sleep(10)
+            continue
+
+        position = positionApi.all_position(marginCoin='USDT', productType='USDT-FUTURES')['data'][idx]
+        leverage = float(position["leverage"])
+        marginRatio=round(float(position['marginRatio']),3)
+        liquidationPrice=round(float(position['liquidationPrice']),1)
+        breakeven = round(float(position['breakEvenPrice']),1)
+        marginSize=round(float(position['marginSize']),1)
+        unrealizedPnL=round(float(position['unrealizedPL']),1)
+        #print(position)
+        achievedProfits=round(float(position['achievedProfits']),1)
+        avg_price = round(float(position['openPriceAvg']),3)
+       
+        usable = calc_usable_range(close_price, Risk_Anchor, position_side)
+
+        factor = dynamic_factor(
+            usable_range=usable,
+            phase=T_market,
+            vol=vol
+        )
+
+        anchor = calc_anchor_price(
+            liquidation_price=Risk_Anchor,
+            factor=factor,
+            side=position_side
+        )
+
+        gap_hist = deque(maxlen=5)
+
+        # 1. 기본 환경 계산
+        usable = calc_usable_range(close_price, Risk_Anchor, position_side)
+        base_factor = dynamic_factor(usable, T_market, vol)
+
+        # 2. anchor 계산
+        anchor = calc_anchor_price(Risk_Anchor, base_factor, position_side)
+
+        # 3. gap 계산
+        gap_ratio = calc_gap_ratio(close_price, anchor)
+        gap_hist.append(gap_ratio)
+
+        print(f"gap_hist: {list(gap_hist)}")
+        #gap_hist = [0.012, 0.014]
+        # 4. gap velocity 계산
         gap_v = gap_velocity(gap_hist)
 
-        #print( 'T_base:', T_PARAMS['T_base'], type(T_PARAMS['T_base']), 'gap_v:', gap_v, type(gap_v), 'hedge_pnl:', hedge_pnl, type(hedge_pnl), 'free_margin:', free_margin, type(free_margin), 'used_margin:', used_margin, type(used_margin), 'alpha:', alpha, type(alpha), 'alpha_base:', T_PARAMS['alpha_base'], type(T_PARAMS['alpha_base']), 'T_min:', T_PARAMS['T_min'], type(T_PARAMS['T_min']), 'T_max:', T_PARAMS['T_max'], type(T_PARAMS['T_max']), 'gap_scale:', T_PARAMS['gap_scale'], type(T_PARAMS['gap_scale']) )
-        T_control = compute_T_control( T_PARAMS['T_base'], gap_v, hedge_pnl, free_margin, used_margin, alpha, T_PARAMS['alpha_base'], T_PARAMS['T_min'], T_PARAMS['T_max'], T_PARAMS['gap_scale'] )
+        # 5. factor 미세 조정
+        final_factor = apply_gap_velocity(base_factor, gap_v)
+
+        Profit_Expansion_Anchor = Market_Stress_Anchor*final_factor
+    
+        gap_sensor = np.clip(gap_v / T_PARAMS['gap_scale'] , 0, 1)
+        hedge_roe = unrealizedPnL / marginSize
+        hedge_market_move = hedge_roe / leverage
+        HEDGE_MOVE_MAX = 0.02   # 2%
+        hedge_sensor = np.clip(abs(hedge_market_move) / HEDGE_MOVE_MAX, 0, 1)
+        SAFE_MARGIN_RATIO = 0.1
+        account_stress = np.clip(
+            marginRatio / SAFE_MARGIN_RATIO,
+            0,
+            1
+        )
+        alpha_base = 0.006   # 기본은 지금보다 약간 낮게
+        k1 = 1.2             # 계좌 압박 가중치
+        k2 = 0.8             # 헤지 약화 가중치
+        alpha_dynamic = alpha_base * (
+            1 + k1 * account_stress
+        ) * (
+            1 + k2 * (1 - hedge_sensor)
+        )
+        alpha_dynamic = np.clip(alpha_dynamic, 0.004, 0.02)  # 0.2% ~ 1% 사이
+        print( T_PARAMS['T_base'],T_PARAMS['T_min'], T_PARAMS['T_max'] )
+        print(f"gap_sensor: {gap_sensor:.4f}, hedge_sensor: {hedge_sensor:.4f}, account_stress: {account_stress:.4f}")
+        print(f"alpha_base: {alpha_base:.4f}, alpha_dynamic: {alpha_dynamic:.4f}")
+        T_control = compute_T_control2(T_PARAMS['T_base'], gap_sensor, hedge_sensor, account_stress, alpha_dynamic, T_PARAMS['T_min'], T_PARAMS['T_max'])
         print("T_control (bars):", T_control)
-        base_time = 12
-        exit_interval = base_time * (T_control / abs(T_market))
+        base_time = 900
+        ratio = (T_control / abs(T_market))
+        ratio = max(0.7, min(ratio, 2.0))
+        exit_interval = base_time * ratio
 
         # --------------------------------------------------
         # t_market / t_control concept (future use)
@@ -890,96 +1222,6 @@ if __name__ == "__main__":
         print(f"Market State: {state}, Alpha Scale: {alpha_scale}, Adjusted Alpha*100: {alpha*100}%")
         print(f"Gap (price): {price * alpha}")
 
-        chgUtc = float(marketApi.ticker(symbol,'USDT-FUTURES')['data'][0]['changeUtc24h'])*100
-        chgUtcWoAbs = chgUtc
-        balances = accountApi.account(coin,'USDT-FUTURES', marginCoin=marginC)
-        free = float(balances['data']['available'])
-        total = float(balances['data']['usdtEquity'])
-        total_div4 = round(float(balances['data']['usdtEquity'])/2,1)  # temporary 이더 최소 분해능이 안나온다 테스트후 2->4 원복 예정
-        amount=round(total/close_price,8)
-        freeamount=round(free/close_price,8)
-        cnt=cnt+1
-        cntm=cntm+1
-        live24data_condition = read_json(filename2)
-        if live24data_condition:
-            live24data = live24data_condition
-            live24data_backup=live24data
-        else:
-            live24data=live24data_backup
-        
-        condition = read_json(filename)
-        if condition:
-            live24 = condition
-            live24_backup=live24
-        else:
-            live24 = live24_backup
-        
-        snapshot = load_snapshot(position_json)
-
-        # 예: long 포지션 증량
-        #rotate_position(snapshot, "long", new_avg=42100, new_size=0.9)
-
-        snapshot["capital"]["core"] = 500
-        snapshot["capital"]["recycled"] = free
-        snapshot["capital"]["external_inflow"] = 0 
-        snapshot["capital"]["free"] = free
-        snapshot["timestamp"] = time.time()
-        snapshot["market"]["current_price"] = close_price
-        snapshot["market"]["volatility"] = vol
-
-        print("exit_interval:", exit_interval)
-        position = positionApi.all_position(marginCoin='USDT', productType='USDT-FUTURES')
-        long_take_profit = live24data['long_take_profit'] #1.001 #live24data['long_take_profit']
-        short_take_profit = live24data['short_take_profit'] #0.999 #live24data['short_take_profit']
-        try:
-            idx = get_pos_index(position,coin,position_side)
-            if position_side == 'short':
-                myutil2.live24flag('short_position_running',filename2,True)
-            elif position_side == 'long':
-                myutil2.live24flag('long_positon_running',filename2,True)
-        except:
-            # 모두 포지션 재개 조건 충족시 가장 작은 사이즈로 진입
-            if position_side == 'short':
-                print("short Positon not found/long_profit > alpha*100: {}/{}".format(long_profit, alpha*100))
-                myutil2.live24flag('short_position_running',filename2,False)
-                if long_profit > alpha*100 and T_market > 0.05: #can_enter_short and 0: #확실히 long 추세확인하고 진입 
-                    orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_profit_line,1), timeInForceValue='normal')
-                    myutil2.live24flag('highest_short_price',filename2,float(close_price))
-                    myutil2.live24flag('short_ankor_price',filename2,float(close_price))
-                    message="[{}]1st Market Short Entry".format(account)
-                    tg_send(message)
-                    time.sleep(30)
-            elif position_side == 'long':
-                print("long Positon not found/short_profit > alpha*100: {}/{}".format(short_profit, alpha*100))
-                myutil2.live24flag('long_position_running',filename2,False)
-                if short_profit > alpha*100 and T_market < -0.05: #can_enter_long and 0: # 확실히 short 추세확인하고 진입
-                    orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='buy', tradeSide='open', marginMode='isolated', productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*long_profit_line,1), timeInForceValue='normal')
-                    myutil2.live24flag('lowest_long_price',filename2,float(close_price))
-                    myutil2.live24flag('long_ankor_price',filename2,float(close_price))
-                    message="[{}]1st Market Long Entry".format(account)
-                    tg_send(message)
-                    time.sleep(30)
-            time.sleep(10)
-            continue
-
-        position = positionApi.all_position(marginCoin='USDT', productType='USDT-FUTURES')['data'][idx]
-        liquidationPrice=round(float(position['liquidationPrice']),1)
-        breakeven = round(float(position['breakEvenPrice']),1)
-
-        unrealizedPnl=round(float(position['unrealizedPL']),1)
-        #print(position)
-        achievedProfits=round(float(position['achievedProfits']),1)
-        avg_price = round(float(position['openPriceAvg']),3)
-
-        short_profit = live24data['short_profit'] #1.001 #live24data['long_take_profit']
-        long_profit = live24data['long_profit'] #0.999 #live24data['short_take_profit']
-
-        if position_side == 'short':
-            current_scale_index = live24data['sell_orders_count']
-            ankor_price= live24data['short_ankor_price']
-        elif position_side == 'long':
-            current_scale_index = live24data['buy_orders_count']
-            ankor_price = live24data['long_ankor_price']
 
         if account == 'Sub10':
             print("position_side: {}, close_price: {}, avg_price: {}, ankor_price: {}, gap_base_rate: {}, gap_expend_rate: {}, current_scale_index: {}, T_market: {}".format(position_side, close_price, avg_price, ankor_price, gap_base_rate, gap_expend_rate, current_scale_index, T_market))
@@ -991,24 +1233,38 @@ if __name__ == "__main__":
             elif position_side == 'long':
                 print("Long Reentry Filter: {}, Long Entry Level: {}".format(reentry_filter, entry_level))
         
-        adjustment_count = current_scale_index + 1  # 1 ~ N
-
-        exit_interval = exit_interval / adjustment_count
-        MIN_EXIT_INTERVAL = 10  # bars or cycles
-        exit_interval = round(max(exit_interval, MIN_EXIT_INTERVAL))
-        timeout = exit_interval # 9분마다 1% 기타줄 세팅 무식해..ㅋ 
-
+        delay_sec = exit_interval # 9분마다 1% 기타줄 세팅 무식해..ㅋ 
+        print("exit_interval: {}-> delay_sec:{}".format(exit_interval,delay_sec))
         # exit_interval_raw=1374
         # adjustment_count=22
         # exit_interval_final=53
 
-        exit_levels = calc_exit_levels(
-            price=price,
-            atr=atr,
-            remaining_count=current_scale_index
+        print("Calculating exit levels with price: {}, atr: {}, remaining_count: {}, side: {}, trend_strength: {}".format(close_price, atr, current_scale_index, position_side, T_market))
+        expansion_score = calc_expansion_score(
+            T_market,
+            ratio,
+            account_stress,
+            hedge_sensor
         )
 
-        #print(exit_levels)
+        profit_multiplier = calc_profit_multiplier(
+            0.01,  # base_profit (1% 목표)
+            expansion_score
+        )
+
+        profit_ceiling = 0.01 * profit_multiplier
+        print(f"Expansion Score: {expansion_score:.4f}, Profit Multiplier: {profit_multiplier:.4f}, Profit Ceiling: {profit_ceiling:.4f}")
+
+        exit_levels =calc_exit_levels(
+            avg_price,
+            atr,
+            current_scale_index,
+            position_side,                       # "long" | "short"
+            T_market_normalized,           # 0 ~ 1 (현재는 곡률에만 사용)
+            profit_ceiling           # 🔥 외부에서 계산된 최종 목표 수익률
+        )
+
+        print(exit_levels)
 
 
  #       print("close_price:{}/avg_price:{}".format(close_price,avg_price))
@@ -1017,13 +1273,15 @@ if __name__ == "__main__":
         short_gap = abs(close_price-live24data['short_avg_price'])
         long_gap = abs(close_price-live24data['long_avg_price'])
 
-        leverage = float(position["leverage"])
         absamount_gap = abs(live24data['short_absamount']-live24data['long_absamount'])
         free_lev = float(freeamount) * float(leverage)
         short_lev = float(live24data['short_absamount']) * float(leverage)
         long_lev = float(live24data['long_absamount']) * float(leverage)
         #print("freeamount:{}/short:{}/long:{}/leverage:{}".format(freeamount,short_lev,long_lev,leverage))
-        set_lev = float(absamount_gap) * float(leverage) /free_lev
+        try:
+            set_lev = float(absamount_gap) * float(leverage) /free_lev
+        except:
+            set_lev = 10
         if set_lev > 50:
            set_lev = 50
         elif set_lev < 10:
@@ -1232,18 +1490,8 @@ if __name__ == "__main__":
                         long_exit()
 
             if position_side == 'short':
-                if return_true_after_minutes(timeout,live24data['short_entry_time'])[0]:   # 30분 마다 1% 이익 세팅
-                    # myutil2.live24flag('short_entry_time',filename2,time.time())
-                    # usable_range = calc_usable_range(
-                    #     liq_price=live24data['long_liquidationPrice'],
-                    #     current_price=close_price,
-                    #     side="short"
-                    # )
-                    # factor = dynamic_profit_factor_v2(
-                    #     vol=vol,
-                    #     phase=T_market,
-                    #     usable_range=usable_range
-                    # )
+                if return_true_after_minutes(delay_sec,live24data['short_entry_time'])[0]:   # 30분 마다 1% 이익 세팅
+                    myutil2.live24flag('short_entry_time',filename2,time.time())
                     result = planApi.current_plan_v2(planType="profit_loss", productType="USDT-FUTURES")
 
                     sell_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'sell' and entry['symbol'] == symbol]
@@ -1251,12 +1499,8 @@ if __name__ == "__main__":
                     first_size=sorted(sell_orders, key=lambda x: float(x['size']),reverse=False)[0]
                     last_size=sorted(sell_orders, key=lambda x: float(x['size']),reverse=False)[-1]
 
-                    if avg_price*0.95 < live24data['long_liquidationPrice']:
-                        sorted_sell_orders_last_price = round(avg_price*0.95,1) #라오어 패치, 최소 이익실현은 10% 부터 시작(10배레버리지의 1% 이익지점)
-                        sorted_sell_orders_last_price_1 = avg_price*0.95 #라오어 패치, 최소 이익실현은 10% 부터 시작(10배레버리지의 1% 이익지점)
-                    else:
-                        sorted_sell_orders_last_price = live24data['long_liquidationPrice'] #라오어 패치, 최소 이익실현은 10% 부터 시작(10배레버리지의 1% 이익지점)
-                        sorted_sell_orders_last_price_1 = live24data['long_liquidationPrice'] #라오어 패치, 최소 이익실현은 10% 부터 시작(10배레버리지의 1% 이익지점)
+                    sorted_sell_orders_last_price = round(Profit_Expansion_Anchor,1)
+                    sorted_sell_orders_last_price_1 = sorted_sell_orders_last_price
 
                     if avg_price*short_profit_line < close_price:
                         trigger_price0 = avg_price*short_profit_line
@@ -1275,22 +1519,11 @@ if __name__ == "__main__":
                         time.sleep(1)
                     if pre_short_count != live24data['sell_orders_count']:
                         if profit > 0:
-                            message = "[Short timeout:{}/count:{}][{}/{}]trigger_price:{}/gap:{}/last:{}]".format(timeout,i,live24data['short_absamount'],achievedProfits,round(trigger_price0,1),round(sell_orders_unitgap),round(sorted_sell_orders_last_price_1))
+                            message = "[Short delay_sec:{}/count:{}][{}/{}]trigger_price:{}/gap:{}/last:{}]".format(delay_sec,i,live24data['short_absamount'],achievedProfits,round(trigger_price0,1),round(sell_orders_unitgap),round(sorted_sell_orders_last_price_1))
                             tg_send(message)
                             pre_short_count = live24data['sell_orders_count']
-                            usable_range = calc_usable_range(
-                                liq_price=live24data['long_liquidationPrice'],
-                                current_price=close_price,
-                                side="short"
-                            )
-                            factor = dynamic_profit_factor_v2(
-                                vol=vol,
-                                phase=T_market,
-                                usable_range=usable_range
-                            )
-                            tg_send(factor)
                 else:
-                    print("short 최저점 조정 남은 시간:{}".format(return_true_after_minutes(timeout,live24data['short_entry_time'])[1]))
+                    print("short 최저점 조정 남은 시간:{}".format(return_true_after_minutes(delay_sec,live24data['short_entry_time'])[1]))
            
 
             # APAE 인데. 실시간 피드백이 아니므로. 조정후 다시 체크해야한다. 예방 주사 개념  calc_APAE (로테이트 방식) -> 포지션 투입하여 JSON 관찰필요 
@@ -1299,29 +1532,15 @@ if __name__ == "__main__":
             # 변동성에 따른 변동 갭 필요함  -> 적용했으나 팩터 체크해야함  
 
             elif position_side == 'long':
-                if return_true_after_minutes(timeout,live24data['long_entry_time'])[0]:
+                if return_true_after_minutes(delay_sec,live24data['long_entry_time'])[0]:
                     myutil2.live24flag('long_entry_time',filename2,time.time())
-                    # usable_range = calc_usable_range(
-                    #     liq_price=live24data['short_liquidationPrice'],
-                    #     current_price=close_price,
-                    #     side="long"
-                    # )
-                    # factor = dynamic_profit_factor_v2(
-                    #     vol=vol,
-                    #     phase=T_market,
-                    #     usable_range=usable_range
-                    # )
                     result = planApi.current_plan_v2(planType="profit_loss", productType="USDT-FUTURES")
 
                     buy_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'buy' and entry['symbol'] == symbol]
                     sorted_buy_orders_last = sorted(buy_orders, key=lambda x: float(x['triggerPrice']),reverse=True)[0]
                     
-                    if avg_price*1.05 < live24data['short_liquidationPrice']:
-                        sorted_buy_orders_last_price = live24data['short_liquidationPrice']  #라오어 패치, 최소 이익실현은 10% 부터 시작(10배레버리지의 1% 이익지점)
-                        sorted_buy_orders_last_price_1 = live24data['short_liquidationPrice']  #라오어 패치, 최소 이익실현은 10% 부터 시작(10배레버리지의 1% 이익지점)
-                    else:
-                        sorted_buy_orders_last_price = round(avg_price*1.05,1) #라오어 패치, 최소 이익실현은 10% 부터 시작(10배레버리지의 1% 이익지점)
-                        sorted_buy_orders_last_price_1 = avg_price*1.05 #라오어 패치, 최소 이익실현은 10% 부터 시작(10배레버리지의 1% 이익지점)
+                    sorted_buy_orders_last_price = round(Profit_Expansion_Anchor,1)  #라오어 패치, 최소 이익실현은 10% 부터 시작(10배레버리지의 1% 이익지점)
+                    sorted_buy_orders_last_price_1 = sorted_buy_orders_last_price #라오어 패치, 최소 이익실현은 10% 부터 시작(10배레버리지의 1% 이익지점)
 
                     profit_line = long_profit_line
  
@@ -1342,21 +1561,10 @@ if __name__ == "__main__":
                         time.sleep(1)
                     if pre_long_count != live24data['buy_orders_count']:
                         if profit > 0:
-                            message = "[Long timeout:{}/count:{}][{}/{}]trigger_price:{}/gap:{}/last:{}]".format(timeout,i,live24data['long_absamount'],achievedProfits,round(trigger_price0,1),round(buy_orders_unitgap),round(sorted_buy_orders_last_price_1))
+                            message = "[Long delay_sec:{}/count:{}][{}/{}]trigger_price:{}/gap:{}/last:{}]".format(delay_sec,i,live24data['long_absamount'],achievedProfits,round(trigger_price0,1),round(buy_orders_unitgap),round(sorted_buy_orders_last_price_1))
                             tg_send(message)
                             pre_long_count = live24data['buy_orders_count']
-                            usable_range = calc_usable_range(
-                                liq_price=live24data['short_liquidationPrice'],
-                                current_price=close_price,
-                                side="long"
-                            )
-                            factor = dynamic_profit_factor_v2(
-                                vol=vol,
-                                phase=T_market,
-                                usable_range=usable_range
-                            )
-                            tg_send(factor)
                 else:
-                    print("long 최고점 조정 남은 시간:{}".format(return_true_after_minutes(timeout,live24data['long_entry_time'])[1]))
+                    print("long 최고점 조정 남은 시간:{}".format(return_true_after_minutes(delay_sec,live24data['long_entry_time'])[1]))
 
 
