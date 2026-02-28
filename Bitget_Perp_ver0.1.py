@@ -918,6 +918,9 @@ def calc_exit_interval_safe(
     min_ratio=0.25,
     max_interval=None
 ):
+    if total_qty <= 0:
+        return base_exit_interval
+
     ratio = max(0.0, min(1.0, remain_qty / total_qty))
     interval = base_exit_interval * (ratio ** gamma)
 
@@ -1442,8 +1445,8 @@ if __name__ == "__main__":
                 else:   
                     condition2 = 0
                     condition3 = 0
-                #print("condition1: {}, condition2: {}, condition3: {}".format(condition1, condition2, condition3))
-                if allow_new_entry:
+                print("condition1: {}, condition2: {}, condition3: {}".format(condition1, condition2, condition3))
+                if allow_new_entry or 1:
                     if condition1 or (condition2 and condition3):
                         try:  # cycle_entry_filter_hysteresis 추세일때만 진입하는 조건문 추가 예정
                             print("short entry/triggerPrice:{}".format(float(close_price)))
@@ -1470,8 +1473,8 @@ if __name__ == "__main__":
                 else:   
                     condition2 = 0
                     condition3 = 0
-                #print("condition1: {}, condition2: {}, condition3: {}".format(condition1, condition2, condition3))    
-                if allow_new_entry:
+                print("condition1: {}, condition2: {}, condition3: {}".format(condition1, condition2, condition3))    
+                if allow_new_entry or 1:
                     if condition1 or (condition2 and condition3):
                         if free > 1:  #cycle_entry_filter_hysteresis # cycle_entry_filter_hysteresis 추세일때만 진입하는 조건문 추가 예정
                             if account == 'Sub10' or account == 'Sub7': #short 포지션이 있고, short_profit이 alpha*100보다 클때만 진입, 다른 계정은 물려있어 해소 될때까지 진입 금지 
@@ -1565,7 +1568,10 @@ if __name__ == "__main__":
                         sorted_sell_orders = sorted(sell_orders, key=lambda x: float(x['size']),reverse=False)[i]
                         sorted_price_sell_orders = sorted(sell_orders, key=lambda x: float(x['triggerPrice']),reverse=True)[i]
                         if account == 'Sub7' or account == 'Sub10': #long 포지션이 있고, long_profit이 alpha*100보다 클때만 진입, 다른 계정은 물려있어 해소 될때까지 진입 금지
-                            trigger_price = exit_levels[i]
+                            if HedgeState.SAFE != hedge_state:  #SAFE 상태가 아닐때는 계정별로 조정된 이익실현 가격으로 TP 조정, SAFE 상태일때는 일반적인 조정 방식으로 TP 조정
+                                trigger_price = exit_levels[i]
+                            else:
+                                trigger_price = str(round(trigger_price0 - (sell_orders_unitgap*(i)),1))
                         else:
                             trigger_price = str(round(trigger_price0 - (sell_orders_unitgap*(i)),1))                               
                         print("[{}/{}][{}/{}][{}/{}]".format(i,sorted_sell_orders['size'],trigger_price,type(trigger_price).__name__,sorted_sell_orders['triggerPrice'],type(sorted_sell_orders['triggerPrice']).__name__))
@@ -1609,8 +1615,11 @@ if __name__ == "__main__":
                     for i in range(len(buy_orders)):
                         sorted_buy_orders = sorted(buy_orders, key=lambda x: float(x['size']),reverse=False)[i]
                         sorted_price_buy_orders = sorted(buy_orders, key=lambda x: float(x['triggerPrice']),reverse=False)[i]
-                        if account == 'Sub7' or account == 'Sub10': #long 포지션이 있고, long_profit이 alpha*100보다 클때만 진입, 다른 계정은 물려있어 해소 될때까지 진입 금지
-                            trigger_price = exit_levels[i]
+                        if account == 'Sub7' or account == 'Sub10': 
+                            if HedgeState.SAFE != hedge_state:  #SAFE 상태가 아닐때는 계정별로 조정된 이익실현 가격으로 TP 조정, SAFE 상태일때는 일반적인 조정 방식으로 TP 조정
+                                trigger_price = exit_levels[i]
+                            else:
+                                trigger_price = str(round(trigger_price0 + (buy_orders_unitgap*(i)),1))
                         else:
                             trigger_price = str(round(trigger_price0 + (buy_orders_unitgap*(i)),1))
                         print("[{}/{}][{}/{}][{}/{}]".format(i,sorted_buy_orders['size'],trigger_price,type(trigger_price).__name__,sorted_buy_orders['triggerPrice'],type(sorted_buy_orders['triggerPrice']).__name__))
