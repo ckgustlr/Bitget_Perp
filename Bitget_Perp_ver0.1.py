@@ -88,20 +88,21 @@ def classify_hedge_state(
     unrealizedPnL: float,
     marginSize: float,
     unrealized_loss_ratio: float,
-    stress: float,        # 0 ~ 1
-    hedge_sensor: float,  # 0 ~ 1
+    stress: float,  # 0 ~ 1
 ):
     """
-    모든 입력은 '강도' 기준
-    sign 제거된 상태로 판단
+    계좌 생존 판단 전용
+    포지션 구조 신호 제거
     """
+
+    if marginSize <= 0:
+        return HedgeState.SAFE
 
     hedge_roe = abs(unrealizedPnL / marginSize)
 
     # -------------------------
-    # Thresholds (튜닝 포인트)
+    # Thresholds
     # -------------------------
-    ROE_SAFE = 0.15
     ROE_WARN = 0.30
 
     LOSS_WARN = 0.20
@@ -110,27 +111,22 @@ def classify_hedge_state(
     STRESS_WARN = 0.60
     STRESS_DANGER = 0.80
 
-    HEDGE_WARN = 0.50
-    HEDGE_DANGER = 0.75
-
     # -------------------------
-    # DANGER (구조 붕괴)
+    # DANGER (계좌 붕괴 위험)
     # -------------------------
     if (
         unrealized_loss_ratio > LOSS_DANGER
         or stress > STRESS_DANGER
-        or hedge_sensor > HEDGE_DANGER
     ):
         return HedgeState.DANGER
 
     # -------------------------
-    # WARNING (미세 제어)
+    # WARNING (공격 축소)
     # -------------------------
     if (
         hedge_roe > ROE_WARN
         or unrealized_loss_ratio > LOSS_WARN
         or stress > STRESS_WARN
-        or hedge_sensor > HEDGE_WARN
     ):
         return HedgeState.WARNING
 
@@ -205,108 +201,80 @@ def apply_gap_velocity(base_factor, gap_v):
 
     return max(0.90, min(adjusted, 0.98))
 
-def short_action(action):
+def adjust_margin(position_side: str, action: str):
     """
-    Unified function for short entry/exit.
-    action: 'entry' or 'exit'
+    position_side: "long" or "short"
+    action: "entry" or "exit"
     """
-    if action == 'entry':
-        print("entry>>liquidationPrice*0.9:{}<close:{}".format(liquidationPrice*0.9, close_price))
-        sign = 1
-        msg_prefix = 'entry>>'
-        msg_mid = '+'
-        msg_usd = '+1USD'
-    elif action == 'exit':
-        sign = -1
-        msg_prefix = 'exit>>'
-        msg_mid = '-'
-        msg_usd = '-1USD'
-    else:
-        raise ValueError("action must be 'entry' or 'exit'")
 
-    percents = [0.08, 0.04, 0.02, 0.01]
-    percent_labels = ['8%', '4%', '2%', '1%']
-    for i, pct in enumerate(percents):
+    # 1️⃣ liquidation multiplier 결정
+    if position_side == "long":
+        liq_factor = 1.1
+        comparison_symbol = ">"
+    else:
+        liq_factor = 0.9
+        comparison_symbol = "<"
+
+    adjusted_liq = liquidationPrice * liq_factor
+
+    print(f"{action}>> liquidationPrice*{liq_factor}:{adjusted_liq} {comparison_symbol} close:{close_price}")
+
+    # 2️⃣ 시도할 비율 목록
+    ratios = [0.08, 0.04, 0.02, 0.01]
+
+    for r in ratios:
         try:
-            cal_amount = round(margin * pct)
-            message = f"{msg_prefix}[{account}][{position_side}]liquidationPrice*0.9:{{}}<close_price:{{}}{msg_mid}{{}}:{{}}".format(
-                liquidationPrice*0.9, close_price, percent_labels[i], cal_amount)
+            cal_amount = round(margin * r)
+
+            # exit이면 음수
+            amount = cal_amount if action == "entry" else -cal_amount
+
+            message = (
+                f"{action}>>[{account}][{position_side}]"
+                f"liq*{liq_factor}:{adjusted_liq} "
+                f"{comparison_symbol} close:{close_price} "
+                f"{'+' if action=='entry' else '-'}{int(r*100)}%:{cal_amount}"
+            )
+
+            result = accountApi.margin(
+                symbol,
+                marginCoin='USDT',
+                productType='USDT-FUTURES',
+                amount=amount,
+                holdSide=position_side
+            )
+
             print(message)
-            result = accountApi.margin(symbol, marginCoin='USDT', productType='USDT-FUTURES', amount=cal_amount*sign, holdSide=position_side)
-            if action == 'exit':
-                print(result)
-            #tg_send(message)
-            break
-        except Exception:
+            print(result)
+            return  # 성공하면 종료
+
+        except Exception as e:
             continue
-    else:
-        try:
-            message = f"{msg_prefix}[{account}][{position_side}]liquidationPrice*0.9:{{}}<close_price:{{}}{msg_usd}".format(liquidationPrice*0.9, close_price)
-            result = accountApi.margin(symbol, marginCoin='USDT', productType='USDT-FUTURES', amount=1*sign, holdSide=position_side)
-            print(message)
-            if action == 'exit':
-                print(result)
-            #tg_send(message)
-        except Exception:
-            pass
 
-def long_action(action):
-    """
-    Unified function for long entry/exit.
-    action: 'entry' or 'exit'
-    """
-    if action == 'entry':
-        print("entry>>liquidationPrice:{}*1.1:{}>close:{}".format(liquidationPrice, liquidationPrice * 1.1, close_price))
-        sign = 1
-        msg_prefix = 'entry>>'
-        msg_mid = '+'
-        msg_usd = '+1USD'
-    elif action == 'exit':
-        print("exit>>liquidationPrice:{}*1.1:{}<close:{}".format(liquidationPrice, liquidationPrice * 1.1, close_price))
-        sign = -1
-        msg_prefix = 'exit>>'
-        msg_mid = '-'
-        msg_usd = '-1USD'
-    else:
-        raise ValueError("action must be 'entry' or 'exit'")
+    # 3️⃣ 최후 fallback → 1 USDT
+    try:
+        amount = 1 if action == "entry" else -1
 
-    percents = [0.08, 0.04, 0.02, 0.01]
-    percent_labels = ['8%', '4%', '2%', '1%']
-    for i, pct in enumerate(percents):
-        try:
-            cal_amount = round(margin * pct)
-            message = f"{msg_prefix}[{account}][{position_side}]liquidationPrice*1.1:{{}}>close_price:{{}}{msg_mid}{{}}:{{}}".format(
-                liquidationPrice * 1.1, close_price, percent_labels[i], cal_amount)
-            print(message)
-            result = accountApi.margin(symbol, marginCoin='USDT', productType='USDT-FUTURES', amount=cal_amount * sign, holdSide=position_side)
-            if action == 'exit':
-                print(result)
-            # tg_send(message)
-            break
-        except Exception:
-            continue
-    else:
-        try:
-            message = f"{msg_prefix}[{account}][{position_side}]liquidationPrice*1.1:{{}}>close_price:{{}}{msg_usd}".format(liquidationPrice * 1.1, close_price)
-            result = accountApi.margin(symbol, marginCoin='USDT', productType='USDT-FUTURES', amount=1 * sign, holdSide=position_side)
-            print(message)
-            if action == 'exit':
-                print(result)
-            # tg_send(message)
-        except Exception:
-            pass
+        message = (
+            f"{action}>>[{account}][{position_side}]"
+            f"liq*{liq_factor}:{adjusted_liq} "
+            f"{comparison_symbol} close:{close_price} "
+            f"{'+1USD' if action=='entry' else '-1USD'}"
+        )
 
-def short_entry():
-    short_action('entry')
+        result = accountApi.margin(
+            symbol,
+            marginCoin='USDT',
+            productType='USDT-FUTURES',
+            amount=amount,
+            holdSide=position_side
+        )
 
-def short_exit():
-    short_action('exit')
+        print(message)
+        print(result)
 
-def long_entry():
-    long_action('entry')
-
-def long_exit():
-    long_action('exit')
+    except:
+        pass
 
 def get_exchange_credentials(account):
     """계정별 API 키를 환경변수에서 로드"""
@@ -914,22 +882,24 @@ def calc_exit_interval_safe(
     total_qty,
     remain_qty,
     base_exit_interval,
-    gamma=1.4,
-    min_ratio=0.25,
+    gamma=1.6,
+    max_ratio=2.5,
     max_interval=None
 ):
     if total_qty <= 0:
         return base_exit_interval
 
     ratio = max(0.0, min(1.0, remain_qty / total_qty))
-    interval = base_exit_interval * (ratio ** gamma)
 
-    min_interval = base_exit_interval * min_ratio
+    # 질량이 줄수록 증가하는 시간
+    interval_multiplier = 1 + ((1 - ratio) ** gamma) * (max_ratio - 1)
+
+    interval = base_exit_interval * interval_multiplier
 
     if max_interval is not None:
         interval = min(interval, max_interval)
 
-    return max(min_interval, interval)
+    return interval
 
 def calc_account_stress(margin_ratio: float) -> float:
     if margin_ratio <= 0.5:
@@ -1263,24 +1233,25 @@ if __name__ == "__main__":
         ratio = max(0.7, min(ratio, 2.0))
         exit_interval = base_time * ratio
 
-        hedge_state = classify_hedge_state(unrealizedPnL,marginSize,hedge_roe_abs,account_stress,hedge_sensor)
-        print(f"Hedge State: {hedge_state}, unrealizedPnL: {unrealizedPnL}, marginSize: {marginSize}, hedge_roe_abs: {hedge_roe_abs}, account_stress: {account_stress}, hedge_sensor: {hedge_sensor}")
+        hedge_state = classify_hedge_state(unrealizedPnL,marginSize,hedge_roe_abs,account_stress)
+        print(f"Hedge State: {hedge_state}, unrealizedPnL: {unrealizedPnL}, marginSize: {marginSize}, hedge_roe_abs: {hedge_roe_abs}, account_stress: {account_stress})
 
         if hedge_state == HedgeState.SAFE:
             allow_new_entry = True
-            allow_scale_in = True
+            allow_scale_in = False
             tighten_exit = False
             force_deleveraging = False
 
         if hedge_state == HedgeState.WARNING:
-            allow_new_entry = False
-            allow_scale_in = False
+            allow_new_entry = True
+            allow_scale_in = True
             tighten_exit = True
             force_deleveraging = False
 
         if hedge_state == HedgeState.DANGER:
             allow_new_entry = False
             allow_scale_in = False
+            tighten_exit = True
             force_deleveraging = True
         # --------------------------------------------------
         # t_market / t_control concept (future use)
@@ -1331,7 +1302,7 @@ if __name__ == "__main__":
                 print("Long Reentry Filter: {}, Long Entry Level: {}".format(reentry_filter, entry_level))
         
         delay_sec = exit_interval # 9분마다 1% 기타줄 세팅 무식해..ㅋ 
-        adjust_delay_sec = calc_exit_interval_safe(total_qty=max_count, remain_qty=current_scale_index, base_exit_interval=exit_interval, gamma=1.4, min_ratio=0.25, max_interval=None)
+        adjust_delay_sec = calc_exit_interval_safe(total_qty=max_count, remain_qty=current_scale_index, base_exit_interval=exit_interval)
         print("delay_sec: {}->{}/{}->adjust_delay_sec:{}".format(delay_sec, current_scale_index, max_count, adjust_delay_sec))
 
         print("Calculating exit levels with price: {}, atr: {}, remaining_count: {},max_count: {}, positionside: {}, trend_strength: {}".format(close_price, atr, current_scale_index, max_count, position_side, T_market))
@@ -1523,7 +1494,9 @@ if __name__ == "__main__":
                     sell_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'sell' and entry['symbol'] == symbol]
                     myutil2.live24flag('sell_orders_count',filename2,len(sell_orders))
                     if liquidationPrice*ShortSafeMargin>close_price:
-                        short_exit()
+                        adjust_margin("short", "exit")
+                    else:
+                        adjust_margin("short", "entry")
                 elif position_side == 'long':                     
                     long_take_profit0= 1+profit_base_rate
                     myutil2.live24flag('long_take_profit',filename2,long_take_profit0)
@@ -1541,7 +1514,9 @@ if __name__ == "__main__":
                     myutil2.live24flag('buy_orders_count',filename2,len(buy_orders))
                     print(message)
                     if liquidationPrice*LongSafeMargin<close_price:
-                        long_exit()
+                        adjust_margin("long", "exit")
+                    else:
+                        adjust_margin("long", "entry")
 
             if position_side == 'short':
                 if return_true_after_minutes(adjust_delay_sec,live24data['short_entry_time'])[0]:   # 30분 마다 1% 이익 세팅
@@ -1568,7 +1543,7 @@ if __name__ == "__main__":
                         sorted_sell_orders = sorted(sell_orders, key=lambda x: float(x['size']),reverse=False)[i]
                         sorted_price_sell_orders = sorted(sell_orders, key=lambda x: float(x['triggerPrice']),reverse=True)[i]
                         if account == 'Sub7' or account == 'Sub10': #long 포지션이 있고, long_profit이 alpha*100보다 클때만 진입, 다른 계정은 물려있어 해소 될때까지 진입 금지
-                            if HedgeState.SAFE != hedge_state:  #SAFE 상태가 아닐때는 계정별로 조정된 이익실현 가격으로 TP 조정, SAFE 상태일때는 일반적인 조정 방식으로 TP 조정
+                            if HedgeState.SAFE != hedge_state and 0:  #SAFE 상태가 아닐때는 계정별로 조정된 이익실현 가격으로 TP 조정, SAFE 상태일때는 일반적인 조정 방식으로 TP 조정
                                 trigger_price = exit_levels[i]
                             else:
                                 trigger_price = str(round(trigger_price0 - (sell_orders_unitgap*(i)),1))
@@ -1616,7 +1591,7 @@ if __name__ == "__main__":
                         sorted_buy_orders = sorted(buy_orders, key=lambda x: float(x['size']),reverse=False)[i]
                         sorted_price_buy_orders = sorted(buy_orders, key=lambda x: float(x['triggerPrice']),reverse=False)[i]
                         if account == 'Sub7' or account == 'Sub10': 
-                            if HedgeState.SAFE != hedge_state:  #SAFE 상태가 아닐때는 계정별로 조정된 이익실현 가격으로 TP 조정, SAFE 상태일때는 일반적인 조정 방식으로 TP 조정
+                            if HedgeState.SAFE != hedge_state and 0:  #SAFE 상태가 아닐때는 계정별로 조정된 이익실현 가격으로 TP 조정, SAFE 상태일때는 일반적인 조정 방식으로 TP 조정
                                 trigger_price = exit_levels[i]
                             else:
                                 trigger_price = str(round(trigger_price0 + (buy_orders_unitgap*(i)),1))
