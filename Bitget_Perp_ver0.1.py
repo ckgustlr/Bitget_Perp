@@ -1674,7 +1674,10 @@ if __name__ == "__main__":
                     first_size=sorted(sell_orders, key=lambda x: float(x['size']),reverse=False)[0]
                     last_size=sorted(sell_orders, key=lambda x: float(x['size']),reverse=False)[-1]
 
-                    sorted_sell_orders_last_price = round(Profit_Expansion_Anchor,1)
+                    if hedge_state == HedgeState.SAFE:
+                        sorted_sell_orders_last_price = round(Market_Stress_Anchor,1)
+                    else:
+                        sorted_sell_orders_last_price = round(Profit_Expansion_Anchor,1)
                     sorted_sell_orders_last_price_1 = sorted_sell_orders_last_price
 
                     if avg_price*short_profit_line < close_price:
@@ -1720,7 +1723,10 @@ if __name__ == "__main__":
                     buy_orders = [entry for entry in  result['data']['entrustedList'] if entry['side'] == 'buy' and entry['symbol'] == symbol]
                     sorted_buy_orders_last = sorted(buy_orders, key=lambda x: float(x['triggerPrice']),reverse=True)[0]
                     
-                    sorted_buy_orders_last_price = round(Profit_Expansion_Anchor,1)  #라오어 패치, 최소 이익실현은 10% 부터 시작(10배레버리지의 1% 이익지점)
+                    if hedge_state == HedgeState.SAFE:
+                        sorted_sell_orders_last_price = round(Market_Stress_Anchor,1)
+                    else:
+                        sorted_sell_orders_last_price = round(Profit_Expansion_Anchor,1) #라오어 패치, 최소 이익실현은 10% 부터 시작(10배레버리지의 1% 이익지점)
                     sorted_buy_orders_last_price_1 = sorted_buy_orders_last_price #라오어 패치, 최소 이익실현은 10% 부터 시작(10배레버리지의 1% 이익지점)
 
                     profit_line = long_profit_line
@@ -1770,6 +1776,8 @@ if __name__ == "__main__":
 
             # 👉 이 다섯 개만 봐도
             # “투입 제어만으로 위험이 얼마나 흡수되는지”가 나온다.
+
+            # 투입제어완료, 실현제어완료(Sub8,9단거만 해소되면 완성) , 손절제어는 위의 팩터로 추가 진행 예정 
 
             if force_deleveraging and 0:
                 if position_side == 'short':
