@@ -316,6 +316,27 @@ def is_weekend_risk_zone(timestamp_ms):
 
     return False
 
+def compute_size_factor(state, apae_score, hedge_sensor):
+
+    # 기본값
+    size_factor = 1.0
+
+    # 1️⃣ State 기반 1차 감속
+    if state == HedgeState.WARNING:
+        size_factor *= 0.7
+    elif state == HedgeState.DANGER:
+        size_factor *= 0.4
+
+    # 2️⃣ APAE 기반 균형 감속 (0 ~ 0.4 영향)
+    apae_factor = 1 - min(apae_score, 0.4)
+    size_factor *= apae_factor
+
+    # 3️⃣ Hedge Sensor 기반 밀집 감속 (완만하게)
+    hedge_factor = 1 - 0.3 * hedge_sensor
+    size_factor *= hedge_factor
+
+    return max(0.2, size_factor)
+
 def resolve_market_state(asset, trend_strength, timestamp, is_macro_event=False):
     if asset == "BTCUSDT":
         return resolve_btc_state(trend_strength, timestamp, is_macro_event)
@@ -846,6 +867,27 @@ def calc_expansion_score(
 
     return np.clip(score, 0, 1)
 
+def compute_size_factor(state, apae_score, hedge_sensor):
+
+    # 기본값
+    size_factor = 1.0
+
+    # 1️⃣ State 기반 1차 감속
+    if state == HedgeState.WARNING:
+        size_factor *= 0.7
+    elif state == HedgeState.DANGER:
+        size_factor *= 0.4
+
+    # 2️⃣ APAE 기반 균형 감속 (0 ~ 0.4 영향)
+    apae_factor = 1 - min(apae_score, 0.4)
+    size_factor *= apae_factor
+
+    # 3️⃣ Hedge Sensor 기반 밀집 감속 (완만하게)
+    hedge_factor = 1 - 0.3 * hedge_sensor
+    size_factor *= hedge_factor
+
+    return max(0.2, size_factor)
+
 def calc_profit_multiplier(
     base_profit,
     expansion_score,
@@ -909,6 +951,35 @@ def calc_account_stress(margin_ratio: float) -> float:
     else:
         return min(1.0, 0.8 + (margin_ratio - 0.7) / 0.15 * 0.2)
 
+def log_hedge_state(
+    position_side,
+    account,
+    hedge_state,
+    apae_score,
+    hedge_sensor,
+    adjust_size_factor
+):
+    global _prev_hedge_state
+
+    message = (
+        f"position:{position_side}, "
+        f"account:{account}, "
+        f"hedge_state:{hedge_state}, "
+        f"APAE:{apae_score:.4f}, "
+        f"hedge_sensor:{hedge_sensor:.3f} "
+        f"-> adjust_size_factor:{adjust_size_factor:.3f}"
+    )
+
+    # 항상 콘솔 출력
+    print(message)
+
+    # 상태 변경 시에만 텔레그램 전송
+    if _prev_hedge_state is None:
+        tg_send(f"[INIT] {message}")
+    elif hedge_state != _prev_hedge_state:
+        tg_send(f"[STATE CHANGE] {message}")
+    _prev_hedge_state = hedge_state
+
 if __name__ == "__main__":
     cnt=0
     cntm=0
@@ -925,6 +996,9 @@ if __name__ == "__main__":
     productType = 'USDT-FUTURES'
     marginC = 'USDT'
     productT='umcbl'
+    prev_close_short = None
+    prev_close_long  = None
+    _prev_hedge_state = None
     profit_base_rate = 0.01 # 1% tp 세팅
     short_profit_line = 0.99 # 기타줄 초기 레벨
     short_profit_line_adjust = 0.999 # 1% 넘었을때 close_price 기준으로 세팅갭 0.1%
@@ -1054,6 +1128,8 @@ if __name__ == "__main__":
         #rotate_position(snapshot, "long", new_avg=42100, new_size=0.9)
 
         position = positionApi.all_position(marginCoin='USDT', productType='USDT-FUTURES')
+        #prev_close_short = live24data['prev_close_short']
+        #prev_close_long = live24data['prev_close_long']
         long_take_profit = live24data['long_take_profit'] #1.001 #live24data['long_take_profit']
         short_take_profit = live24data['short_take_profit'] #0.999 #live24data['short_take_profit']
         short_profit = live24data['short_profit'] #1.001 #live24data['long_take_profit']
@@ -1067,10 +1143,7 @@ if __name__ == "__main__":
             Market_Stress_Anchor = live24data['long_liquidationPrice']
             if current_scale_index > short_max_count:
                 short_max_count = current_scale_index
-                myutil2.live24flag('short_max_count',filename2,short_max_count)
-            if current_scale_index == 0:
-                short_max_count = 0
-                myutil2.live24flag('short_max_count',filename2,short_max_count)    
+                myutil2.live24flag('short_max_count',filename2,short_max_count) 
             max_count = short_max_count
 
         elif position_side == 'long':
@@ -1082,9 +1155,6 @@ if __name__ == "__main__":
             if current_scale_index > long_max_count:
                 long_max_count = current_scale_index
                 myutil2.live24flag('long_max_count',filename2,long_max_count)
-            if current_scale_index == 0:
-                long_max_count = 0
-                myutil2.live24flag('long_max_count',filename2,long_max_count)    
             max_count = long_max_count
         raw_data = marketApi.get_perp_candles("BTCUSDT", "1H", limit=100)
         data =raw_data['data']
@@ -1133,6 +1203,8 @@ if __name__ == "__main__":
             # 모두 포지션 재개 조건 충족시 가장 작은 사이즈로 진입
             if position_side == 'short':
                 myutil2.live24flag('short_position_running',filename2,False)
+                short_max_count = 0
+                myutil2.live24flag('short_max_count',filename2,short_max_count)   
                 condition1 = long_profit > Adjusted_Alpha_100
                 condition2 = T_market > 0.05
                 print("condition1:{} / condition2: {} / long_profit > Adjusted_Alpha_100: {} > {} / T_market:{} > 0.05".format(condition1, condition2, long_profit, Adjusted_Alpha_100, T_market))
@@ -1145,8 +1217,10 @@ if __name__ == "__main__":
                     time.sleep(30)
             elif position_side == 'long':
                 myutil2.live24flag('long_position_running',filename2,False)
+                long_max_count = 0
+                myutil2.live24flag('long_max_count',filename2,long_max_count)  
                 condition1 = short_profit > Adjusted_Alpha_100
-                condition2 = T_market < -0.05
+                condition2 = T_market < -0.05  
                 print("condition1:{} / condition2: {} / short_profit > Adjusted_Alpha_100: {} > {} / T_market:{} < -0.05".format(condition1, condition2, short_profit, Adjusted_Alpha_100, T_market))
                 if condition1 and condition2: #can_enter_long and 0: #확실히 short 추세확인하고 진입 
                     orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='buy', tradeSide='open', marginMode='isolated', productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*long_profit_line,1), timeInForceValue='normal')
@@ -1234,7 +1308,7 @@ if __name__ == "__main__":
         exit_interval = base_time * ratio
 
         hedge_state = classify_hedge_state(unrealizedPnL,marginSize,hedge_roe_abs,account_stress)
-        print(f"Hedge State: {hedge_state}, unrealizedPnL: {unrealizedPnL}, marginSize: {marginSize}, hedge_roe_abs: {hedge_roe_abs}, account_stress: {account_stress})
+        print(f"Hedge State: {hedge_state}, unrealizedPnL: {unrealizedPnL}, marginSize: {marginSize}, hedge_roe_abs: {hedge_roe_abs}, account_stress: {account_stress}")
 
         if hedge_state == HedgeState.SAFE:
             allow_new_entry = True
@@ -1404,24 +1478,46 @@ if __name__ == "__main__":
             ShortSafeMargin = 0.9
             LongSafeMargin = 1.1
             bet_size = bet_size_base*bet_sizex
-            
+
+            APAE = calc_APAE(snapshot)
+            print(APAE)
+            adjust_size_factor = compute_size_factor(hedge_state, APAE['APAE_score'], hedge_sensor)
+            log_hedge_state(
+                position_side,
+                account,
+                hedge_state,
+                APAE['APAE_score'],
+                hedge_sensor,
+                adjust_size_factor
+            )
+
             if position_side == 'short':
                 if live24data['long_position_running']:
                     print("long_profit:{} > alpha*100:{}".format(long_profit, alpha*100))
                 print("highest_short_price:{}*(1+{}:{}):{}<close_price:{}".format(live24data['highest_short_price'],live24data['short_gap_rate'],1+live24data['short_gap_rate'],live24data['highest_short_price']*(1+live24data['short_gap_rate']),close_price))
                 condition1 = float(live24data['highest_short_price'])*(1+live24data['short_gap_rate'])<close_price
                 if account == 'Sub10' or account == 'Sub7':
-                    condition2 = reentry_filter
-                    condition3 = entry_level < close_price
+                    condition2 = reentry_filter or hedge_state == HedgeState.SAFE
+                    condition3_short = (
+                        prev_close_short is not None and
+                        prev_close_short <= entry_level and
+                        close_price > entry_level
+                    )
                 else:   
                     condition2 = 0
                     condition3 = 0
-                print("condition1: {}, condition2: {}, condition3: {}".format(condition1, condition2, condition3))
-                if allow_new_entry or 1:
-                    if condition1 or (condition2 and condition3):
-                        try:  # cycle_entry_filter_hysteresis 추세일때만 진입하는 조건문 추가 예정
+                    condition3_short = 0
+                print("condition1: {}, condition2: {}, condition3_short: {}".format(condition1, condition2, condition3_short))
+                if hedge_state != HedgeState.DANGER:
+                    if condition1 or (condition2 and condition3_short):
+                        try:  
                             print("short entry/triggerPrice:{}".format(float(close_price)))
                             myutil2.live24flag('highest_short_price',filename2,float(close_price))
+                            if hedge_state == HedgeState.WARNING:
+                                if coin == "BTCUSDT":
+                                    bet_size = round(bet_size*adjust_size_factor,4)
+                                elif coin == "QQQUSDT":
+                                    bet_size = round(bet_size*adjust_size_factor,2)
                             orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_take_profit,1), timeInForceValue='normal')
                             time.sleep(5)
                             position = positionApi.all_position(marginCoin='USDT', productType='USDT-FUTURES')['data'][idx]
@@ -1439,17 +1535,27 @@ if __name__ == "__main__":
                     print("short_profit:{} > alpha*100:{}".format(short_profit, alpha*100))
                 condition1 = float(live24data['lowest_long_price'])*(1-live24data['long_gap_rate'])>close_price
                 if account == 'Sub10' or account == 'Sub7':
-                    condition2 = reentry_filter
-                    condition3 = entry_level > close_price
+                    condition2 = reentry_filter or hedge_state == HedgeState.SAFE# 유동성 재활용 필터 off 적용은 SAFE 때만 적용해보고, 추이를 모니터링  
+                    condition3_long = (
+                        prev_close_long is not None and
+                        prev_close_long >= entry_level and
+                        close_price < entry_level
+                    )
                 else:   
                     condition2 = 0
                     condition3 = 0
-                print("condition1: {}, condition2: {}, condition3: {}".format(condition1, condition2, condition3))    
-                if allow_new_entry or 1:
-                    if condition1 or (condition2 and condition3):
+                    condition3_long = 0
+                print("condition1: {}, condition2: {}, condition3_long: {}".format(condition1, condition2, condition3_long))    
+                if hedge_state != HedgeState.DANGER:
+                    if condition1 or (condition2 and condition3_long):
                         if free > 1:  #cycle_entry_filter_hysteresis # cycle_entry_filter_hysteresis 추세일때만 진입하는 조건문 추가 예정
                             if account == 'Sub10' or account == 'Sub7': #short 포지션이 있고, short_profit이 alpha*100보다 클때만 진입, 다른 계정은 물려있어 해소 될때까지 진입 금지 
                                 try:
+                                    if hedge_state == HedgeState.WARNING:
+                                        if coin == "BTCUSDT":
+                                            bet_size = round(bet_size*adjust_size_factor,4)
+                                        elif coin == "QQQUSDT":
+                                            bet_size = round(bet_size*adjust_size_factor,2)
                                     orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='buy', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), timeInForceValue='normal',presetStopSurplusPrice=round(close_price*long_take_profit,1))
                                     time.sleep(5)
                                     position = positionApi.all_position(marginCoin='USDT', productType='USDT-FUTURES')['data'][idx]
@@ -1462,14 +1568,13 @@ if __name__ == "__main__":
                                     message="[free:{}][{}_{}_{}][{}][{}][size:{}]물량투입 실패:{}USD->cancel all orders".format(free,account,coin,position_side,close_price,profit,round(bet_size,8),total_div4)
                                     minutem=0
 
-            result = calc_APAE(snapshot)
-
-            print("=== APAE RESULT ===")
-            print(result)
-
             save_snapshot(snapshot, position_json)
 
             print("count:{}".format(cnt))
+            prev_close_short = close_price
+            prev_close_long  = close_price
+            myutil2.live24flag('prev_close_short',filename2,close_price)
+            myutil2.live24flag('prev_close_long',filename2,close_price)            
             time.sleep(10)
 
             if cnt%6 ==0:
