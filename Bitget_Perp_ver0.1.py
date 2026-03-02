@@ -920,7 +920,36 @@ def update_runtime(snapshot, close_price, vol, free):
     snapshot["market"]["current_price"] = close_price
     snapshot["market"]["volatility"] = vol
 
-def calc_exit_interval_safe(
+def calc_exit_interval_fast(
+    total_qty,
+    remain_qty,
+    base_exit_interval,
+    gamma=1.4,
+    min_ratio=0.25,
+    max_interval=None
+):
+    if total_qty <= 0:
+        return base_exit_interval
+
+    ratio = max(0.0, min(1.0, remain_qty / total_qty))
+    interval = base_exit_interval * (ratio ** gamma)
+
+    min_interval = base_exit_interval * min_ratio
+
+    if max_interval is not None:
+        interval = min(interval, max_interval)
+
+    return max(min_interval, interval)
+
+def calc_account_stress(margin_ratio: float) -> float:
+    if margin_ratio <= 0.5:
+        return margin_ratio / 0.5 * 0.5          # 0 ~ 0.5
+    elif margin_ratio <= 0.7:
+        return 0.5 + (margin_ratio - 0.5) / 0.2 * 0.3   # 0.5 ~ 0.8
+    else:
+        return min(1.0, 0.8 + (margin_ratio - 0.7) / 0.15 * 0.2)
+
+def calc_exit_interval_slow(
     total_qty,
     remain_qty,
     base_exit_interval,
@@ -1376,8 +1405,14 @@ if __name__ == "__main__":
                 print("Long Reentry Filter: {}, Long Entry Level: {}".format(reentry_filter, entry_level))
         
         delay_sec = exit_interval # 9분마다 1% 기타줄 세팅 무식해..ㅋ 
-        adjust_delay_sec = calc_exit_interval_safe(total_qty=max_count, remain_qty=current_scale_index, base_exit_interval=exit_interval)
-        print("delay_sec: {}->{}/{}->adjust_delay_sec:{}".format(delay_sec, current_scale_index, max_count, adjust_delay_sec))
+        if hedge_state == HedgeState.SAFE:
+            adjust_delay_slow = calc_exit_interval_slow(total_qty=max_count, remain_qty=current_scale_index, base_exit_interval=exit_interval)
+            adjust_delay_sec = adjust_delay_slow
+            print("delay_sec: {}->{}/{}->adjust_delay_slow:{}".format(delay_sec, current_scale_index, max_count, adjust_delay_slow))
+        else:
+            adjust_delay_fast = calc_exit_interval_fast(total_qty=max_count, remain_qty=current_scale_index, base_exit_interval=exit_interval)
+            adjust_delay_sec = adjust_delay_fast
+            print("delay_sec: {}->{}/{}->adjust_delay_fast:{}".format(delay_sec, current_scale_index, max_count, adjust_delay_fast))
 
         print("Calculating exit levels with price: {}, atr: {}, remaining_count: {},max_count: {}, positionside: {}, trend_strength: {}".format(close_price, atr, current_scale_index, max_count, position_side, T_market))
         expansion_score = calc_expansion_score(
@@ -1519,6 +1554,9 @@ if __name__ == "__main__":
                                 elif coin == "QQQUSDT":
                                     bet_size = round(bet_size*adjust_size_factor,2)
                             orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_take_profit,1), timeInForceValue='normal')
+                            if condition3_short:
+                                message="[ReUseVol][{}/{}][entry:{}][count:{}][state:{}]".format(account,coin,lose_price,current,current_scale_index,hedge_state)
+                                tg_send(message)     
                             time.sleep(5)
                             position = positionApi.all_position(marginCoin='USDT', productType='USDT-FUTURES')['data'][idx]
                             avg_price = round(float(position['openPriceAvg']),3)
@@ -1557,6 +1595,9 @@ if __name__ == "__main__":
                                         elif coin == "QQQUSDT":
                                             bet_size = round(bet_size*adjust_size_factor,2)
                                     orderApi.place_order(symbol, marginCoin=marginC, size=bet_size,side='buy', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='limit', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), timeInForceValue='normal',presetStopSurplusPrice=round(close_price*long_take_profit,1))
+                                    if condition3_long:
+                                        message="[ReUseVol][{}/{}][entry:{}][count:{}][state:{}]".format(account,coin,lose_price,current,current_scale_index,hedge_state)
+                                        tg_send(message)                                       
                                     time.sleep(5)
                                     position = positionApi.all_position(marginCoin='USDT', productType='USDT-FUTURES')['data'][idx]
                                     avg_price = round(float(position['openPriceAvg']),3)
@@ -1712,6 +1753,23 @@ if __name__ == "__main__":
                             pre_long_count = live24data['buy_orders_count']
                 else:
                     print("long 최고점 조정 남은 시간:{}".format(return_true_after_minutes(adjust_delay_sec,live24data['long_entry_time'])[1]))
+
+            # if hedge_state == HedgeState.DANGER:
+            #     intensity = calc_cut_intensity(APAE, hedge_sensor)
+            #     cut_ratio = calc_cut_ratio(intensity)
+            # 모니터링 포인트
+            # DANGER 진입 빈도
+
+            # DANGER 체류 시간
+
+            # DANGER 중 신규 진입 여부 (0이면 성공)
+
+            # WARNING ↔ SAFE 복귀 속도
+
+            # SAFE에서의 평단 개선 속도
+
+            # 👉 이 다섯 개만 봐도
+            # “투입 제어만으로 위험이 얼마나 흡수되는지”가 나온다.
 
             if force_deleveraging and 0:
                 if position_side == 'short':
