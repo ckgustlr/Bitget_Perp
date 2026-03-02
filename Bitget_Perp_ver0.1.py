@@ -1241,7 +1241,7 @@ if __name__ == "__main__":
                     orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='sell', tradeSide='open', marginMode='isolated',  productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*short_profit_line,1), timeInForceValue='normal')
                     myutil2.live24flag('highest_short_price',filename2,float(close_price))
                     myutil2.live24flag('short_ankor_price',filename2,float(close_price))
-                    message="[{}]1st Market Short Entry".format(account)
+                    message="[{}]1st Market Short Entry/ankor_price:{}".format(account,close_price)
                     tg_send(message)
                     time.sleep(30)
             elif position_side == 'long':
@@ -1255,7 +1255,7 @@ if __name__ == "__main__":
                     orderApi.place_order(symbol, marginCoin=marginC, size=bet_size_base,side='buy', tradeSide='open', marginMode='isolated', productType = "USDT-FUTURES", orderType='market', price=close_price, clientOrderId='sanfran6@'+str(int(time.time()*100)), presetStopSurplusPrice=round(close_price*long_profit_line,1), timeInForceValue='normal')
                     myutil2.live24flag('lowest_long_price',filename2,float(close_price))
                     myutil2.live24flag('long_ankor_price',filename2,float(close_price))  
-                    message="[{}]1st Market Long Entry".format(account)
+                    message="[{}]1st Market Long Entry/ankor_price:{}".format(account,close_price)
                     tg_send(message)
                     time.sleep(30)
             time.sleep(10)
